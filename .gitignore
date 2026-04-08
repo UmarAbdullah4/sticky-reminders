@@ -1,0 +1,18 @@
+# Your settings. config.json holds your server address, account names and
+# (encrypted) credentials - it must never be committed.
+config.json
+config.json.*
+
+# Backups, set-aside damaged files and temp files the app writes
+*.bak
+*.bak-*
+*.corrupt-*
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# Test output (screenshots, throwaway data)
+tests/out*/
+tests/dryrun/

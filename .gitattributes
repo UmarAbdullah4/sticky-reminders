@@ -1,0 +1,7 @@
+# Store text with LF line endings whatever the editor or OS, so diffs stay
+# clean between Windows and everything else.
+* text=auto eol=lf
+
+*.pyw text eol=lf diff=python
+*.py  text eol=lf diff=python
+*.png binary
