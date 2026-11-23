@@ -1,0 +1,8 @@
+# Sticky Reminders runs on the Python standard library alone.
+# These are optional, and each one switches a feature on:
+
+websockets>=13      # Mattermost, Slack and Discord connectors
+pystray>=0.19       # system tray icon
+pillow>=9.0         # draws the tray icon (needed together with pystray)
+anthropic>=2.0      # the Claude option of the assistant (OpenAI, Gemini and
+                    # open-source endpoints need nothing extra)
