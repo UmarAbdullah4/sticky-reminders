@@ -1,7 +1,14 @@
 """
-Sticky Reminders  -  v2.0
+Sticky Reminders  -  v2.1
 =========================
 A desktop sticky-notes + reminder app with Mattermost integration.
+
+What changed in v2.1:
+  * Tasks inside every note (the "Tasks" tab of an open note)
+  * Per-task progress: a percentage you drag, or named stages you step through
+  * Bullet-point notes per task
+  * Priority and colour per task
+  * Overall progress on the note header and on the card in the main grid
 
 What changed in v2:
   * Reminder engine rewritten (absolute schedule, no minute-modulo bug)
@@ -36,10 +43,10 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 APP_NAME = "Sticky Reminders"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 # ─── Paths ───
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -110,6 +117,10 @@ MUTE_CHOICES = [("30 minutes", 30), ("1 hour", 60), ("2 hours", 120),
                 ("4 hours", 240), ("8 hours", 480), ("Until tomorrow", -1),
                 ("Until I turn it back on", -2)]
 
+# Stages a new stage-tracked task starts with (each task can have its own).
+DEFAULT_STAGES = ["Plan", "Do", "Review", "Done"]
+MAX_STAGES = 12
+
 DEFAULT_CONFIG = {
     "mattermost_url": "",
     "username": "",
@@ -130,6 +141,8 @@ DEFAULT_CONFIG = {
     "close_to_tray": True,
     "due_reminders": True,
     "window_geometry": "",
+    "task_mode": "percent",          # progress style for new tasks: "percent" | "stages"
+    "task_stages": list(DEFAULT_STAGES),
 }
 
 
@@ -170,6 +183,38 @@ def _atomic_write(path, text):
     os.replace(tmp, path)
 
 
+def _normalise_task(t, fallback_id):
+    """Fill in / repair one task so the UI can rely on its shape."""
+    if not isinstance(t, dict):
+        t = {"title": str(t)}
+    if not isinstance(t.get("id"), int):
+        t["id"] = fallback_id
+    t["title"] = str(t.get("title") or "")[:200]
+    raw = t.get("stages")
+    stages = [str(s).strip()[:40] for s in (raw if isinstance(raw, list) else [])
+              if str(s).strip()]
+    t["stages"] = stages[:MAX_STAGES] or list(DEFAULT_STAGES)
+    t["mode"] = "stages" if t.get("mode") == "stages" else "percent"
+    for key, top in (("percent", 100), ("stage", len(t["stages"]))):
+        try:
+            t[key] = max(0, min(top, int(t.get(key) or 0)))
+        except (TypeError, ValueError):
+            t[key] = 0
+    raw = t.get("points")
+    t["points"] = [str(x).strip() for x in (raw if isinstance(raw, list) else [])
+                   if str(x).strip()]
+    t["collapsed"] = bool(t.get("collapsed", False))
+    try:
+        t["priority"] = max(0, min(len(PRIORITIES) - 1, int(t.get("priority", 1))))
+    except (TypeError, ValueError):
+        t["priority"] = 1
+    c = t.get("color")                    # None = same colour as the note
+    t["color"] = c if type(c) is int and 0 <= c < len(COLORS) else None
+    t.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
+    t.setdefault("done_at", "")
+    return t
+
+
 def _normalise(n, fallback_id):
     """Fill in fields added in v2 so old notes keep working."""
     n.setdefault("id", fallback_id)
@@ -187,6 +232,17 @@ def _normalise(n, fallback_id):
     n.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
     n.setdefault("done_at", "")
     n.setdefault("pinned", False)
+    # v2.1: tasks
+    raw = n.get("tasks")
+    tasks = [_normalise_task(t, i + 1)
+             for i, t in enumerate(raw if isinstance(raw, list) else [])]
+    seen = set()
+    for t in tasks:                       # ids must be unique within a note
+        if t["id"] in seen:
+            t["id"] = max(seen) + 1
+        seen.add(t["id"])
+    n["tasks"] = tasks
+    n.setdefault("view", "text")          # which tab the note was last left on
     return n
 
 
@@ -251,6 +307,55 @@ def humanise_delta(td):
     return f"{d}d {h}h"
 
 
+def task_progress(t):
+    """0-100 for one task, whichever way it tracks progress."""
+    if t.get("mode") == "stages":
+        stages = t.get("stages") or []
+        return round(100 * t.get("stage", 0) / len(stages)) if stages else 0
+    return max(0, min(100, int(t.get("percent", 0))))
+
+
+def task_status(t):
+    """Short progress label for a task: '40%' or '2/4'."""
+    if t.get("mode") == "stages":
+        return f"{t.get('stage', 0)}/{len(t.get('stages') or [])}"
+    return f"{task_progress(t)}%"
+
+
+def note_progress(n):
+    """(tasks finished, tasks in total, overall percent) for a note."""
+    tasks = n.get("tasks") or []
+    if not tasks:
+        return 0, 0, 0
+    pcts = [task_progress(t) for t in tasks]
+    done = sum(1 for p in pcts if p >= 100)
+    if done == len(pcts):
+        return done, len(pcts), 100
+    # never round an unfinished note up to 100%
+    return done, len(pcts), min(99, round(sum(pcts) / len(pcts)))
+
+
+def note_label(n, empty="(empty note)"):
+    """Something to call a note by: its text, else its task titles."""
+    text = (n.get("text") or "").strip()
+    if text:
+        return text
+    titles = [t.get("title", "").strip() for t in n.get("tasks") or []]
+    titles = [t for t in titles if t]
+    return ("Tasks: " + ", ".join(titles)) if titles else empty
+
+
+def task_text(n):
+    """Everything searchable inside a note's tasks."""
+    bits = []
+    for t in n.get("tasks") or []:
+        bits.append(t.get("title", ""))
+        bits.extend(t.get("points") or [])
+        if t.get("mode") == "stages":
+            bits.extend(t.get("stages") or [])
+    return " ".join(bits)
+
+
 def dark_titlebar(win):
     """Paint the native title bar dark so it matches the app."""
     try:
@@ -307,6 +412,32 @@ def force_foreground(win):
         win.focus_force()
     except Exception:
         pass
+
+
+def work_area(x, y):
+    """Usable rectangle (left, top, right, bottom) of the monitor at a point,
+    taskbar excluded - or None if Windows will not say."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        u = ctypes.windll.user32
+        u.MonitorFromPoint.restype = wintypes.HANDLE
+        u.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        u.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        mon = u.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 2)   # nearest monitor
+        if mon and u.GetMonitorInfoW(mon, ctypes.byref(info)):
+            r = info.rcWork
+            return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    return None
 
 
 def run_hidden(args):
@@ -422,6 +553,40 @@ def shade(hex_colour, factor):
         return f"#{r:02X}{g:02X}{b:02X}"
     except Exception:
         return hex_colour
+
+
+def mix(a, b, t):
+    """Blend colour `a` towards `b`: t=0 gives a, t=1 gives b."""
+    try:
+        pa = [int(a.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
+        pb = [int(b.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
+        return "#{:02X}{:02X}{:02X}".format(
+            *(int(x + (y - x) * t) for x, y in zip(pa, pb)))
+    except Exception:
+        return a
+
+
+def is_dark(hex_colour):
+    try:
+        h = hex_colour.lstrip("#")
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+        return (0.299 * r + 0.587 * g + 0.114 * b) < 110
+    except Exception:
+        return False
+
+
+def task_palette(col):
+    """Colours for task rows and progress bars, derived from a note colour so
+    they sit naturally on any note - including the grey 'done' style."""
+    dark = is_dark(col["bg"])
+    return {
+        "surface": shade(col["bg"], 1.20 if dark else 0.955),
+        "track":   shade(col["bg"], 1.50 if dark else 0.87),
+        "fill":    shade(col["header"], 1.35 if dark else 0.80),
+        "done":    "#4CC38A" if dark else "#2E9B63",
+        "ink":     col["text"],
+        "dim":     mix(col["text"], col["bg"], 0.38),
+    }
 
 
 def configure_rich_tags(txt, fg, bg="#FFFFFF"):
@@ -544,6 +709,908 @@ class Tooltip:
             except Exception:
                 pass
             self.tip = None
+
+
+# ═══════════════════════════════════════════════════════
+#  Tasks
+# ═══════════════════════════════════════════════════════
+#
+# A note can carry a list of tasks, stored on the note as `tasks`, so they are
+# saved, backed up and exported along with it. Each task has:
+#
+#   mode      "percent" or "stages" - how its progress is tracked
+#   percent   0-100, used in percent mode
+#   stages    the task's own ordered stage names, used in stages mode
+#   stage     how many of those stages are complete
+#   points    its bullet-point notes
+#   priority  index into PRIORITIES, same scale as a note's priority
+#   color     index into COLORS, or None to follow the note's colour
+#
+# task_progress() turns either mode into 0-100, so anything that only needs
+# "how far along is this" (cards, the header bar, export) ignores the mode.
+
+def _ellipsize(font, text, width):
+    """Trim `text` with an ellipsis until it fits `width` pixels."""
+    if font.measure(text) <= width:
+        return text
+    while text and font.measure(text + "…") > width:
+        text = text[:-1]
+    return (text.rstrip() + "…") if text else ""
+
+
+class PercentBar(tk.Canvas):
+    """A progress bar that is its own control: click or drag to set it."""
+
+    STEP = 5
+
+    def __init__(self, parent, value, pal, bg, scale=1.0, on_drag=None,
+                 on_commit=None, readonly=False):
+        self.knob = max(5, int(round(7 * scale)))    # knob radius, also the side inset
+        self.thick = max(4, int(round(8 * scale)))   # bar thickness
+        super().__init__(parent, height=self.knob * 2 + 2, width=60, bg=bg,
+                         highlightthickness=0, bd=0,
+                         cursor="arrow" if readonly else "hand2")
+        self.value = value
+        self._committed = value
+        self.pal = pal
+        self.surface = bg
+        self.readonly = readonly
+        self.on_drag = on_drag
+        self.on_commit = on_commit
+        self.bind("<Configure>", lambda e: self.draw())
+        if not readonly:
+            self.bind("<Button-1>", self._drag)
+            self.bind("<B1-Motion>", self._drag)
+            self.bind("<ButtonRelease-1>", self._drop)
+
+    def set(self, value):
+        """Show a value that was changed from outside the bar."""
+        self.value = self._committed = value
+        self.draw()
+
+    def draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        x0, x1 = self.knob, w - self.knob
+        if x1 <= x0:
+            return
+        cy = h // 2
+        y0 = cy - self.thick // 2
+        y1 = y0 + self.thick
+        colour = self.pal["done"] if self.value >= 100 else self.pal["fill"]
+        xf = x0 + (x1 - x0) * self.value / 100
+        self.create_rectangle(x0, y0, x1, y1, fill=self.pal["track"], outline="")
+        if self.value > 0:
+            self.create_rectangle(x0, y0, xf, y1, fill=colour, outline="")
+        if not self.readonly:
+            r = self.knob - 1
+            self.create_oval(xf - r, cy - r, xf + r, cy + r, fill=colour,
+                             outline=self.surface, width=2)
+
+    def _drag(self, e):
+        span = max(1, self.winfo_width() - 2 * self.knob)
+        v = round((e.x - self.knob) / span * 100 / self.STEP) * self.STEP
+        v = max(0, min(100, int(v)))
+        if v != self.value:
+            self.value = v
+            self.draw()
+            if self.on_drag:
+                self.on_drag(v)
+
+    def _drop(self, _):
+        if self.value != self._committed:
+            self._committed = self.value
+            if self.on_commit:
+                self.on_commit(self.value)
+
+
+class StageBar(tk.Canvas):
+    """One clickable segment per stage, with the stage names underneath.
+
+    Stages are completed in order. Clicking a segment completes everything up
+    to and including it; clicking the last completed one steps back.
+    """
+
+    def __init__(self, parent, stages, done, pal, bg, fonts, scale=1.0,
+                 on_pick=None, readonly=False):
+        self.f_norm, self.f_bold = fonts
+        self.bar_h = max(6, int(round(10 * scale)))
+        self.gap = max(2, int(round(3 * scale)))
+        self.lab_y = self.bar_h + max(2, int(round(3 * scale)))
+        super().__init__(parent, width=60, bg=bg, highlightthickness=0, bd=0,
+                         height=self.lab_y + self.f_bold.metrics("linespace") + 1,
+                         cursor="arrow" if readonly else "hand2")
+        self.stages = stages
+        self.done = done
+        self.pal = pal
+        self.on_pick = on_pick
+        self.bind("<Configure>", lambda e: self.draw())
+        if not readonly:
+            self.bind("<Button-1>", self._click)
+
+    def _seg(self):
+        n = max(1, len(self.stages))
+        return (self.winfo_width() - self.gap * (n - 1)) / n
+
+    def draw(self):
+        self.delete("all")
+        n = len(self.stages)
+        seg = self._seg()
+        if not n or seg < 4:
+            return
+        pal = self.pal
+        all_done = self.done >= n
+        for i, name in enumerate(self.stages):
+            x0 = i * (seg + self.gap)
+            x1 = x0 + seg
+            if i < self.done:                       # completed
+                self.create_rectangle(x0, 0, x1, self.bar_h, outline="",
+                                      fill=pal["done"] if all_done else pal["fill"])
+                font, ink = self.f_norm, pal["ink"]
+            elif i == self.done:                    # the stage being worked on
+                self.create_rectangle(x0 + 1, 1, x1 - 1, self.bar_h - 1, width=2,
+                                      outline=pal["fill"], fill=pal["track"])
+                font, ink = self.f_bold, pal["ink"]
+            else:                                   # still ahead
+                self.create_rectangle(x0, 0, x1, self.bar_h, outline="",
+                                      fill=pal["track"])
+                font, ink = self.f_norm, pal["dim"]
+            self.create_text((x0 + x1) / 2, self.lab_y, anchor="n", font=font,
+                             fill=ink, text=_ellipsize(font, name, seg - 2))
+
+    def _click(self, e):
+        n = len(self.stages)
+        if not n or not self.on_pick:
+            return
+        i = max(0, min(n - 1, int(e.x // (self._seg() + self.gap))))
+        self.on_pick(i if i + 1 == self.done else i + 1)
+
+
+class TaskPanel:
+    """The Tasks view of an open note.
+
+    Structural changes (add, delete, reorder, expand, switch progress style)
+    rebuild the list. Progress changes repaint only the affected row, so
+    dragging a bar or ticking a stage never costs focus or scroll position.
+    """
+
+    ADD_HINT = "Add a task and press Enter"
+    POINT_HINT = "•  Add a note…"
+
+    def __init__(self, app, parent, top, note, col, readonly, on_progress):
+        self.app = app
+        self.top = top                    # the note window - parent for dialogs
+        self.note = note
+        self.col = col                    # shared and mutable: recolouring edits it in place
+        self.ro = readonly
+        self.on_progress = on_progress    # called when anything the cards/header show changes
+        self.pal = task_palette(col)
+        self._refs = {}                   # task id -> widgets repainted in place
+        self._ticked = {}                 # task id -> progress before it was ticked off
+        self._swapped = {}                # task id -> its last progress-style conversion
+        try:
+            self.scale = max(1.0, top.winfo_fpixels("1i") / 96.0)
+        except Exception:
+            self.scale = 1.0
+        self.f_tiny = tkfont.Font(family="Segoe UI", size=8)
+        self.f_tiny_b = tkfont.Font(family="Segoe UI", size=8, weight="bold")
+        self.f_body = tkfont.Font(family="Segoe UI", size=10)
+
+        self.frame = tk.Frame(parent, bg=col["bg"])
+
+        # "add a task" field, pinned under the list so it is always in reach
+        self.add_entry = None
+        if not readonly:
+            self.add_row = tk.Frame(self.frame)
+            self.add_row.pack(side="bottom", fill="x", pady=(8, 0))
+            self.add_plus = tk.Label(self.add_row, text="+", padx=9,
+                                     font=("Segoe UI Semibold", 12), cursor="xterm")
+            self.add_plus.pack(side="left")
+            self.add_var = tk.StringVar()
+            self.add_entry = tk.Entry(self.add_row, textvariable=self.add_var,
+                                      font=self.f_body, relief="flat", bd=0,
+                                      highlightthickness=0)
+            self.add_entry.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
+            self.add_entry.bind("<Return>", self._add_from_entry)
+            # The hint is a label laid over the empty field rather than text put
+            # into it, so it stays readable while the field has focus.
+            self.add_ph = tk.Label(self.add_entry, text=self.ADD_HINT, font=self.f_body,
+                                   bd=0, padx=0, pady=0, cursor="xterm")
+            self.add_var.trace_add("write", lambda *a: self._add_hint())
+            for w in (self.add_plus, self.add_ph):
+                w.bind("<Button-1>", lambda e: self.add_entry.focus_set())
+
+        # scrolling list
+        self.sb = tk.Scrollbar(self.frame, orient="vertical", relief="flat", bd=0,
+                               width=10, highlightthickness=0)
+        self.sb.pack(side="right", fill="y", padx=(6, 0))
+        self.cv = tk.Canvas(self.frame, width=10, height=10, bg=col["bg"],
+                            highlightthickness=0, bd=0, yscrollcommand=self.sb.set)
+        self.cv.pack(side="left", fill="both", expand=True)
+        self.sb.config(command=self.cv.yview)
+        self.inner = tk.Frame(self.cv, bg=col["bg"])
+        self._win = self.cv.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>",
+                        lambda e: self.cv.configure(scrollregion=self.cv.bbox("all")))
+        self.cv.bind("<Configure>",
+                     lambda e: self.cv.itemconfig(self._win, width=e.width))
+
+        # Take the mouse wheel while the pointer is over the list and hand it
+        # back to the main window afterwards (same hand-off the settings use).
+        self.frame.bind("<Enter>",
+                        lambda e: app.root.bind_all("<MouseWheel>", self._wheel))
+        self.frame.bind("<Leave>",
+                        lambda e: app.root.bind_all("<MouseWheel>", app._main_wheel))
+
+        if self.add_entry is not None:
+            self._add_hint()
+        self.render()
+
+    # ── plumbing ──
+    def _wheel(self, e):
+        try:
+            box = self.cv.bbox("all")
+            if box and box[3] > self.cv.winfo_height():
+                self.cv.yview_scroll(-1 * (e.delta // 120), "units")
+        except tk.TclError:
+            pass
+
+    def focus_add(self):
+        if self.add_entry is not None:
+            self.add_entry.focus_set()
+
+    def _add_hint(self):
+        if self.add_var.get():
+            self.add_ph.place_forget()
+        else:
+            self.add_ph.place(x=4, rely=0.5, anchor="w")   # x=4 keeps the caret visible
+
+    def _mini(self, parent, text, cmd, tip=None, enabled=True, pal=None):
+        """Small flat button used inside a task."""
+        pal = pal or self.pal
+        fill = pal["track"]
+        b = tk.Label(parent, text=text, font=self.app.font_tiny, bg=fill,
+                     fg=pal["ink"] if enabled else pal["dim"], padx=7, pady=1)
+        if enabled:
+            b.config(cursor="hand2")
+            b.bind("<Button-1>", lambda e: cmd())
+            b.bind("<Enter>", lambda e: b.config(bg=shade(fill, 0.92)))
+            b.bind("<Leave>", lambda e: b.config(bg=fill))
+            if tip:
+                Tooltip(b, tip)
+        return b
+
+    # ── rendering ──
+    def render(self, scroll_to=None):
+        """Rebuild the list from the note's data and the current colours."""
+        self.pal = pal = task_palette(self.col)
+        bg = self.col["bg"]
+        keep = self.cv.yview()[0]
+        for w in self.inner.winfo_children():
+            w.destroy()
+        self._refs = {}
+        for w in (self.frame, self.cv, self.inner):
+            w.config(bg=bg)
+        self.sb.config(bg=self.col["header"], troughcolor=bg,
+                       activebackground=self.col["header"])
+        if self.add_entry is not None:
+            field = pal["surface"]
+            self.add_row.config(bg=field)
+            self.add_plus.config(bg=field, fg=pal["dim"])
+            self.add_ph.config(bg=field, fg=pal["dim"])
+            self.add_entry.config(
+                bg=field, fg=pal["ink"], insertbackground=pal["ink"],
+                selectbackground=self.col["header"], selectforeground="#1A1A1A")
+
+        tasks = self.note["tasks"]
+        if not tasks:
+            self._empty_state()
+        for i, t in enumerate(tasks):
+            self._row(t, i, len(tasks))
+
+        self.inner.update_idletasks()
+        self.cv.configure(scrollregion=self.cv.bbox("all"))
+        self.cv.yview_moveto(keep if scroll_to is None else scroll_to)
+
+    def _empty_state(self):
+        bg, pal = self.col["bg"], self.pal
+        box = tk.Frame(self.inner, bg=bg)
+        box.pack(fill="x", pady=(26, 0))
+        tk.Label(box, text="No tasks on this note" if self.ro else "No tasks yet",
+                 font=("Segoe UI Semibold", 11), bg=bg, fg=pal["ink"]).pack()
+        if not self.ro:
+            tk.Label(box, text="Break this note into tasks. Each one gets its own\n"
+                               "progress - a percentage or named stages - and its\n"
+                               "own bullet-point notes.",
+                     font=self.app.font_small, bg=bg, fg=pal["dim"],
+                     justify="center").pack(pady=(4, 0))
+
+    def _task_colour(self, t):
+        """The colour a task is drawn in: its own if it has one, else the
+        note's. A completed note stays grey throughout, like its text."""
+        own = t.get("color")
+        if own is None or self.ro:
+            return self.col
+        return COLORS[own % len(COLORS)]
+
+    def _row(self, t, index, count):
+        col = self._task_colour(t)
+        pal = task_palette(col)
+        surf, ink, dim = pal["surface"], pal["ink"], pal["dim"]
+        is_open = not t.get("collapsed")
+        refs = self._refs[t["id"]] = {"pal": pal}
+
+        def mini(*args, **kw):
+            return self._mini(*args, pal=pal, **kw)
+
+        outer = tk.Frame(self.inner, bg=surf)
+        outer.pack(fill="x", pady=(0, 6))
+        if col is not self.col:
+            # a task with its own colour also gets a solid edge in that colour
+            tk.Frame(outer, bg=col["header"],
+                     width=max(4, int(4 * self.scale))).pack(side="left", fill="y")
+        card = tk.Frame(outer, bg=surf)
+        card.pack(side="left", fill="both", expand=True)
+
+        # ── header line: tick, title, priority, status, expander ──
+        head = tk.Frame(card, bg=surf)
+        head.pack(fill="x", padx=8, pady=6)
+
+        tick = tk.Label(head, font=("Segoe UI Symbol", 12), bg=surf, width=2)
+        tick.pack(side="left")
+        refs["tick"] = tick
+        if not self.ro:
+            tick.config(cursor="hand2")
+            tick.bind("<Button-1>", lambda e: self._toggle_done(t))
+            Tooltip(tick, "Tick off / un-tick this task")
+
+        def toggles(w):
+            w.config(cursor="hand2")
+            w.bind("<Button-1>", lambda e: self._toggle_open(t))
+
+        arrow = tk.Label(head, text="▾" if is_open else "▸", bg=surf, fg=dim,
+                         font=("Segoe UI Symbol", 13), padx=4, pady=0)
+        arrow.pack(side="right")
+        toggles(arrow)
+        Tooltip(arrow, "Collapse" if is_open else "Progress and notes")
+        if not is_open:
+            # an open task shows its progress in full below, so only a
+            # collapsed one needs the summary up here
+            status = tk.Label(head, font=("Segoe UI Semibold", 9), bg=surf)
+            status.pack(side="right", padx=(6, 2))
+            toggles(status)
+            refs["status"] = status
+            if t["points"]:
+                k = len(t["points"])
+                hint = tk.Label(head, text=f"{k} note{'' if k == 1 else 's'}",
+                                font=self.app.font_tiny, bg=surf, fg=dim)
+                hint.pack(side="right", padx=(6, 0))
+                toggles(hint)
+        if t["priority"] != 1:
+            # on the right, so titles stay lined up whether or not it is there
+            name, colour, _ = PRIORITIES[t["priority"]]
+            flag = tk.Label(head, text=name, font=("Segoe UI Semibold", 8), bg=colour,
+                            fg=self.app._readable_on(colour), padx=6, pady=0)
+            flag.pack(side="right", padx=(6, 2))
+            toggles(flag)
+
+        if self.ro:
+            title = tk.Label(head, text=t["title"] or "Untitled task", bg=surf, anchor="w")
+        else:
+            title = tk.Entry(head, bg=surf, relief="flat", bd=0, highlightthickness=0,
+                             insertbackground=ink, selectbackground=col["header"],
+                             selectforeground="#1A1A1A")
+            title.insert(0, t["title"])
+            title.bind("<KeyRelease>", lambda e: self._rename(t, title))
+            title.bind("<<Paste>>", lambda e: title.after_idle(lambda: self._rename(t, title)))
+            title.bind("<FocusOut>", lambda e: self._rename(t, title, leaving=True))
+            title.bind("<Return>", lambda e: (self.focus_add(), "break")[1])
+        title.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        refs["title"] = title
+
+        if not is_open:
+            # collapsed: a hairline of progress along the bottom edge
+            line = tk.Frame(card, bg=pal["track"], height=max(3, int(3 * self.scale)))
+            line.pack(fill="x")
+            refs["line"] = tk.Frame(line)
+            self._paint_row(t)
+            return
+
+        body = tk.Frame(card, bg=surf)
+        body.pack(fill="x", padx=12, pady=(0, 10))
+
+        # ── how progress is tracked, plus move / delete ──
+        ctl = tk.Frame(body, bg=surf)
+        ctl.pack(fill="x")
+        tk.Label(ctl, text="Progress", font=("Segoe UI Semibold", 8), bg=surf,
+                 fg=dim).pack(side="left", padx=(0, 8))
+        if not self.ro:
+            for key, label, tip in (
+                    ("percent", "Percent", "Track this task as a percentage"),
+                    ("stages", "Stages", "Track this task through named stages")):
+                on = t["mode"] == key
+                chip = tk.Label(ctl, text=label, padx=8, pady=1, cursor="hand2",
+                                font=("Segoe UI Semibold", 8) if on else self.app.font_tiny,
+                                bg=pal["fill"] if on else pal["track"],
+                                fg=self.app._readable_on(pal["fill"]) if on else dim)
+                chip.pack(side="left", padx=(0, 3))
+                chip.bind("<Button-1>", lambda e, k=key: self._set_mode(t, k))
+                Tooltip(chip, tip)
+            mini(ctl, "✕", lambda: self._delete(t), "Delete this task").pack(side="right")
+            mini(ctl, "↓", lambda: self._move(t, 1), "Move down",
+                       enabled=index < count - 1).pack(side="right", padx=3)
+            mini(ctl, "↑", lambda: self._move(t, -1), "Move up",
+                       enabled=index > 0).pack(side="right")
+
+        if t["mode"] == "percent":
+            prow = tk.Frame(body, bg=surf)
+            prow.pack(fill="x", pady=(8, 0))
+            val = tk.Label(prow, font=("Segoe UI Semibold", 10), bg=surf, fg=ink,
+                           width=5, anchor="e")
+            val.pack(side="right")
+            refs["val"] = val
+            if not self.ro:
+                mini(prow, "−", lambda: self._nudge(t, -1),
+                           "5% less").pack(side="left", padx=(0, 4))
+                mini(prow, "+", lambda: self._nudge(t, 1),
+                           "5% more").pack(side="right", padx=(4, 0))
+            bar = PercentBar(prow, t["percent"], pal, surf, self.scale,
+                             on_drag=lambda v: self._drag_percent(t, v),
+                             on_commit=lambda v: self._set_percent(t, v),
+                             readonly=self.ro)
+            bar.pack(side="left", fill="x", expand=True)
+            refs["bar"] = bar
+        else:
+            sbar = StageBar(body, t["stages"], t["stage"], pal, surf,
+                            (self.f_tiny, self.f_tiny_b), self.scale,
+                            on_pick=lambda k: self._set_stage(t, k), readonly=self.ro)
+            sbar.pack(fill="x", pady=(8, 0))
+            refs["sbar"] = sbar
+            crow = tk.Frame(body, bg=surf)
+            crow.pack(fill="x", pady=(3, 0))
+            if not self.ro:
+                mini(crow, "Edit stages", lambda: self._edit_stages(t),
+                           "Rename, add or remove this task's stages").pack(side="right")
+            cap = tk.Label(crow, font=self.app.font_tiny, bg=surf, fg=dim, anchor="w")
+            cap.pack(side="left", fill="x", expand=True)
+            refs["cap"] = cap
+
+        # ── bullet-point notes ──
+        tk.Label(body, text="Notes", font=("Segoe UI Semibold", 8), bg=surf,
+                 fg=dim).pack(anchor="w", pady=(10, 3))
+        self._points_box(body, t, pal, col)
+        if not self.ro:
+            self._attributes(body, t, pal)
+        self._paint_row(t)
+
+    def _attributes(self, parent, t, pal):
+        """Priority and colour pickers for one task - side by side when the
+        row is wide enough, stacked when it is not."""
+        surf, dim = pal["surface"], pal["dim"]
+        row = tk.Frame(parent, bg=surf)
+        row.pack(fill="x", pady=(10, 0))
+        row.columnconfigure(0, weight=1)
+
+        pri = tk.Frame(row, bg=surf)
+        tk.Label(pri, text="Priority", font=("Segoe UI Semibold", 8), bg=surf,
+                 fg=dim).pack(side="left", padx=(0, 8))
+        for i, (name, colour, _) in enumerate(PRIORITIES):
+            on = t["priority"] == i
+            chip = tk.Label(pri, text=name, padx=7, pady=1, cursor="hand2",
+                            font=("Segoe UI Semibold", 8) if on else self.app.font_tiny,
+                            bg=colour if on else pal["track"],
+                            fg=self.app._readable_on(colour) if on else dim)
+            chip.pack(side="left", padx=(0, 3))
+            chip.bind("<Button-1>", lambda e, v=i: self._set_priority(t, v))
+
+        colr = tk.Frame(row, bg=surf)
+        clabel = tk.Label(colr, text="Colour", font=("Segoe UI Semibold", 8), bg=surf,
+                          fg=dim)
+        dots = tk.Frame(colr, bg=surf)
+        dots.pack(side="left")
+        choices = [(None, "○", dim, "Same colour as the note")]
+        choices += [(i, "●", c["header"], c["name"]) for i, c in enumerate(COLORS)]
+        for value, glyph, ink, tip in choices:
+            on = t["color"] == value
+            # the 1px highlight ring doubles as the "selected" outline
+            dot = tk.Label(dots, text=glyph, font=("Segoe UI Symbol", 11), bg=surf,
+                           fg=ink, cursor="hand2", padx=1, pady=0, highlightthickness=1,
+                           highlightbackground=pal["ink"] if on else surf)
+            dot.pack(side="left", padx=1)
+            dot.bind("<Button-1>", lambda e, v=value: self._set_colour(t, v))
+            Tooltip(dot, tip)
+
+        state = {"wide": None}
+
+        def arrange(_=None):
+            # One line when both fit: the dots sit at the far end and need no
+            # label there. Otherwise they drop to a labelled line of their own.
+            have = max(row.winfo_width(), self.cv.winfo_width() - 40)
+            wide = have >= pri.winfo_reqwidth() + dots.winfo_reqwidth() + 12
+            if wide != state["wide"]:
+                state["wide"] = wide
+                pri.grid(row=0, column=0, sticky="w")
+                if wide:
+                    clabel.pack_forget()
+                    colr.grid(row=0, column=1, sticky="e", pady=0)
+                else:
+                    clabel.pack(side="left", padx=(0, 6), before=dots)
+                    colr.grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        row.bind("<Configure>", arrange)
+        arrange()
+
+    def _paint_row(self, t):
+        """Refresh the progress-dependent parts of one row in place."""
+        r = self._refs.get(t["id"])
+        if not r:
+            return
+        pal = r["pal"]
+        pct = task_progress(t)
+        done = pct >= 100
+        try:
+            r["tick"].config(text="✔" if done else ("◐" if pct else "○"),
+                             fg=pal["done"] if done else pal["ink"])
+            if "status" in r:
+                r["status"].config(text=task_status(t),
+                                   fg=pal["done"] if done else pal["ink"])
+            r["title"].config(
+                font=("Segoe UI Semibold", 10, "overstrike") if done
+                else ("Segoe UI Semibold", 10),
+                fg=pal["dim"] if done else pal["ink"])
+            if "val" in r:
+                r["val"].config(text=f"{pct}%")
+            if "bar" in r and r["bar"].value != t["percent"]:
+                r["bar"].set(t["percent"])
+            elif "bar" in r:
+                r["bar"].draw()
+            if "sbar" in r:
+                r["sbar"].stages = t["stages"]
+                r["sbar"].done = t["stage"]
+                r["sbar"].draw()
+            if "cap" in r:
+                r["cap"].config(text=self._stage_caption(t))
+            if "line" in r:
+                r["line"].config(bg=pal["done"] if done else pal["fill"])
+                if pct:
+                    r["line"].place(x=0, y=0, relheight=1, relwidth=pct / 100)
+                else:
+                    r["line"].place_forget()
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _stage_caption(t):
+        stages, k = t["stages"], t["stage"]
+        if k >= len(stages):
+            return f"All {len(stages)} stages complete"
+        if k == 0:
+            return f"Not started  ·  first up: {stages[0]}"
+        return f"{k} of {len(stages)} done  ·  now: {stages[k]}"
+
+    def _points_box(self, parent, t, pal, col):
+        """The task's notes: one bullet per line, bullets managed for you."""
+        if self.ro:
+            lbl = tk.Label(parent, font=self.f_body, bg=pal["surface"], justify="left",
+                           anchor="w", fg=pal["ink"] if t["points"] else pal["dim"],
+                           text="\n".join("•  " + x for x in t["points"]) or "No notes.")
+            lbl.pack(fill="x")
+            lbl.bind("<Configure>", lambda e: lbl.config(wraplength=max(60, e.width - 4)))
+            return
+
+        pt = tk.Text(parent, height=1, width=10, wrap="word", font=self.f_body,
+                     bg=col["bg"], fg=pal["ink"], relief="flat", bd=0, padx=8, pady=6,
+                     insertbackground=pal["ink"], undo=True, highlightthickness=0,
+                     selectbackground=col["header"], selectforeground="#1A1A1A")
+        pt.pack(fill="x")
+        # wrapped lines hang under the text, not under the bullet
+        pt.tag_configure("pt", lmargin2=self.f_body.measure("• "))
+        pt.tag_configure("ph", foreground=pal["dim"])
+        pt._ph = False
+
+        def fit(_=None):
+            """Grow/shrink to fit the text - the list scrolls, not this box."""
+            try:
+                n = int(pt.tk.call(pt._w, "count", "-update", "-displaylines",
+                                   "1.0", "end-1c") or 0) + 1
+            except Exception:
+                n = int(pt.index("end-1c").split(".")[0])
+            if int(pt.cget("height")) != n:
+                pt.configure(height=n)
+
+        def load():
+            pt._ph = not t["points"]
+            pt.delete("1.0", "end")
+            if pt._ph:
+                pt.insert("1.0", self.POINT_HINT, "ph")
+            else:
+                pt.insert("1.0", "\n".join("• " + x for x in t["points"]), "pt")
+            pt.edit_reset()
+            fit()
+
+        def read():
+            out = []
+            if not pt._ph:
+                for ln in pt.get("1.0", "end-1c").split("\n"):
+                    s = ln.strip().lstrip("•").strip()
+                    if s:
+                        out.append(s)
+            return out
+
+        def store():
+            new = read()
+            if new != t["points"]:
+                t["points"] = new
+                save_notes(self.app.notes)
+
+        def changed(_=None):
+            try:
+                if pt._ph:
+                    return
+                if not pt.get("1.0", "end-1c"):
+                    pt.insert("1.0", "• ")
+                pt.tag_add("pt", "1.0", "end")
+                store()
+                fit()
+            except tk.TclError:
+                pass
+
+        def focus_in(_=None):
+            if pt._ph:
+                pt._ph = False
+                pt.delete("1.0", "end")
+                pt.insert("1.0", "• ", "pt")
+                pt.edit_reset()
+
+        def focus_out(_=None):
+            try:
+                store()
+                load()                    # tidy the bullets, or bring the hint back
+            except tk.TclError:
+                pass
+
+        def enter(_=None):
+            line = pt.get("insert linestart", "insert lineend").strip()
+            if line not in ("", "•"):     # never leave an empty bullet behind
+                pt.insert("insert", "\n• ")
+                pt.see("insert")
+                changed()
+            return "break"
+
+        def backspace(_=None):
+            if pt.tag_ranges("sel"):
+                return None
+            ln, c = (int(x) for x in pt.index("insert").split("."))
+            if c <= 2 and pt.get(f"{ln}.0", f"{ln}.2") == "• ":
+                if ln > 1:                # join with the bullet above
+                    pt.delete(f"{ln - 1}.end", f"{ln}.2")
+                    changed()
+                return "break"
+            return None
+
+        pt.bind("<KeyRelease>", changed)
+        pt.bind("<<Paste>>", lambda e: pt.after_idle(changed), add="+")
+        pt.bind("<<Cut>>", lambda e: pt.after_idle(changed), add="+")
+        pt.bind("<FocusIn>", focus_in)
+        pt.bind("<FocusOut>", focus_out)
+        pt.bind("<Return>", enter)
+        pt.bind("<BackSpace>", backspace)
+        pt.bind("<Configure>", fit)
+        load()
+
+    # ── changes ──
+    def _progress_changed(self, t):
+        """Persist a progress change and repaint everything that shows it."""
+        done = task_progress(t) >= 100
+        if done and not t.get("done_at"):
+            t["done_at"] = datetime.now().isoformat(timespec="seconds")
+        elif not done:
+            t["done_at"] = ""
+        save_notes(self.app.notes)
+        self._paint_row(t)
+        self.on_progress()
+
+    @staticmethod
+    def _value(t):
+        return t["mode"], t["stage"] if t["mode"] == "stages" else t["percent"]
+
+    def _toggle_done(self, t):
+        if task_progress(t) >= 100:
+            # un-tick: back to wherever it stood before it was ticked off
+            was = self._ticked.pop(t["id"], None)
+            back = was[1] if was and was[0] == t["mode"] else 0
+            if t["mode"] == "stages":
+                t["stage"] = min(back, len(t["stages"]) - 1)
+            else:
+                t["percent"] = min(back, 100 - PercentBar.STEP)
+        else:
+            self._ticked[t["id"]] = self._value(t)
+            if t["mode"] == "stages":
+                t["stage"] = len(t["stages"])
+            else:
+                t["percent"] = 100
+        self._progress_changed(t)
+
+    def _drag_percent(self, t, value):
+        t["percent"] = value              # live preview; saved when the drag ends
+        self._paint_row(t)
+
+    def _set_percent(self, t, value):
+        t["percent"] = max(0, min(100, int(value)))
+        self._progress_changed(t)
+
+    def _nudge(self, t, direction):
+        step, cur = PercentBar.STEP, t["percent"]
+        if direction > 0:
+            self._set_percent(t, (cur // step) * step + step)
+        else:
+            self._set_percent(t, -(-cur // step) * step - step)
+
+    def _set_stage(self, t, count):
+        t["stage"] = max(0, min(len(t["stages"]), int(count)))
+        self._progress_changed(t)
+
+    def _set_mode(self, t, mode):
+        """Switch between percent and stages, carrying the progress across."""
+        if t["mode"] == mode:
+            return
+        before = self._value(t)
+        pct = task_progress(t)
+        memo = self._swapped.get(t["id"])
+        t["mode"] = mode
+        if memo and memo["to"] == before and memo["from"][0] == mode:
+            # nothing changed since the last switch: go back exactly, so
+            # flipping to and fro never erodes the value
+            t["stage" if mode == "stages" else "percent"] = memo["from"][1]
+        elif mode == "stages":
+            n = len(t["stages"])
+            t["stage"] = n if pct >= 100 else int(pct * n / 100)
+        else:
+            t["percent"] = pct
+        self._swapped[t["id"]] = {"from": before, "to": self._value(t)}
+        if self.app.config.get("task_mode") != mode:   # new tasks follow your last choice
+            self.app.config["task_mode"] = mode
+            save_config(self.app.config)
+        self.render()
+        self._progress_changed(t)
+
+    def _toggle_open(self, t):
+        t["collapsed"] = not t.get("collapsed")
+        save_notes(self.app.notes)
+        self.render()
+
+    def _set_priority(self, t, value):
+        if t["priority"] != value:
+            t["priority"] = value
+            save_notes(self.app.notes)
+            self.render()
+            self.on_progress()
+
+    def _set_colour(self, t, value):
+        if t["color"] != value:
+            t["color"] = value
+            save_notes(self.app.notes)
+            self.render()
+            self.on_progress()
+
+    def _rename(self, t, entry, leaving=False):
+        try:
+            title = entry.get()[:200]
+            if leaving and not title.strip():
+                title = "Untitled task"
+                entry.delete(0, "end")
+                entry.insert(0, title)
+        except tk.TclError:
+            return
+        if title != t["title"]:
+            t["title"] = title
+            save_notes(self.app.notes)
+
+    def _move(self, t, delta):
+        tasks = self.note["tasks"]
+        i = tasks.index(t)
+        j = i + delta
+        if 0 <= j < len(tasks):
+            tasks[i], tasks[j] = tasks[j], tasks[i]
+            save_notes(self.app.notes)
+            self.render()
+
+    def _delete(self, t):
+        if t["points"] or task_progress(t) > 0:
+            if not messagebox.askyesno(
+                    "Delete task",
+                    f"Delete \"{t['title'] or 'Untitled task'}\" with its "
+                    f"progress and notes?", parent=self.top):
+                return
+        self.note["tasks"] = [x for x in self.note["tasks"] if x is not t]
+        save_notes(self.app.notes)
+        self.render()
+        self.on_progress()
+
+    def _add_from_entry(self, _=None):
+        entry = self.add_entry
+        title = entry.get().strip()
+        if not title:
+            entry.delete(0, "end")        # stray spaces would hide the hint
+            return "break"
+        tasks = self.note["tasks"]
+        cfg = self.app.config
+        t = _normalise_task({
+            "id": max((x["id"] for x in tasks), default=0) + 1,
+            "title": title,
+            "mode": cfg.get("task_mode", "percent"),
+            "stages": list(cfg.get("task_stages") or DEFAULT_STAGES),
+            # the first task opens up to show what a task holds; later ones
+            # stay compact so several can be typed in a row
+            "collapsed": bool(tasks),
+        }, 0)
+        tasks.append(t)
+        save_notes(self.app.notes)
+        entry.delete(0, "end")
+        self.render(scroll_to=1.0)
+        self.on_progress()
+        return "break"
+
+    def _edit_stages(self, t):
+        d = tk.Toplevel(self.top)
+        d.title("Stages")
+        d.configure(bg=T.panel)
+        d.geometry("330x380+{}+{}".format(self.top.winfo_rootx() + 70,
+                                          self.top.winfo_rooty() + 90))
+        d.minsize(300, 300)
+        d.transient(self.top)
+        try:                              # stay above a pinned note
+            d.attributes("-topmost", bool(self.top.attributes("-topmost")))
+        except tk.TclError:
+            pass
+        d.after(60, lambda: dark_titlebar(d))
+        d.bind("<Escape>", lambda e: d.destroy())
+
+        tk.Label(d, text="Stages for this task", font=("Segoe UI Semibold", 11),
+                 bg=T.panel, fg=T.fg).pack(anchor="w", padx=16, pady=(14, 0))
+        tk.Label(d, text=f"One per line, in the order they happen (up to {MAX_STAGES}).",
+                 font=self.app.font_tiny, bg=T.panel,
+                 fg=T.fg_faint).pack(anchor="w", padx=16, pady=(2, 8))
+
+        bar = tk.Frame(d, bg=T.panel)
+        bar.pack(side="bottom", fill="x", padx=16, pady=12)
+        as_default = tk.BooleanVar(value=False)
+        tk.Checkbutton(d, text="Use these stages for new tasks too", variable=as_default,
+                       font=self.app.font_small, bg=T.panel, fg=T.fg_dim,
+                       selectcolor=T.panel2, activebackground=T.panel,
+                       activeforeground=T.fg, bd=0, highlightthickness=0, anchor="w",
+                       cursor="hand2").pack(side="bottom", anchor="w", padx=14, pady=(8, 0))
+
+        box = tk.Text(d, font=("Segoe UI", 10), bg=T.panel2, fg=T.fg, relief="flat",
+                      bd=0, padx=10, pady=8, width=10, height=4, undo=True,
+                      insertbackground=T.fg, highlightthickness=0)
+        box.pack(fill="both", expand=True, padx=16)
+        box.insert("1.0", "\n".join(t["stages"]))
+        box.edit_reset()
+        box.focus_set()
+
+        def save(_=None):
+            names = [ln.strip()[:40] for ln in box.get("1.0", "end-1c").split("\n")
+                     if ln.strip()][:MAX_STAGES]
+            if not names:
+                messagebox.showwarning("Stages", "Add at least one stage.", parent=d)
+                return "break"
+            was_done = t["stage"] >= len(t["stages"])
+            t["stages"] = names
+            # shrinking the list must never finish a task by accident
+            t["stage"] = len(names) if was_done else min(t["stage"], len(names) - 1)
+            if as_default.get():
+                self.app.config["task_stages"] = list(names)
+                save_config(self.app.config)
+            d.destroy()
+            self.render()
+            self._progress_changed(t)
+            return "break"
+
+        self.app._btn(bar, "Save", save, bg=T.accent, fg="#1A1A1A",
+                      pad=(18, 5)).pack(side="right")
+        self.app._btn(bar, "Cancel", d.destroy).pack(side="right", padx=8)
+        d.bind("<Control-Return>", save)
 
 
 # ═══════════════════════════════════════════════════════
@@ -1404,8 +2471,7 @@ class StickyNotesApp:
                     n["due_notified"] = True
                     changed = True
                     if self.can_notify():
-                        self.show_toast("Due now", (n.get("text") or "(empty note)")[:90],
-                                        color=T.err)
+                        self.show_toast("Due now", note_label(n)[:90], color=T.err)
             if changed:
                 save_notes(self.notes)
                 self.render_notes()
@@ -1522,7 +2588,12 @@ class StickyNotesApp:
                      bg=T.panel2, fg=pr[1]).pack(side="left", padx=(0, 8))
         if note.get("source") == "mattermost":
             tk.Label(meta, text=f"✉ @{note.get('sender', '?')}", font=self.font_tiny,
-                     bg=T.panel2, fg=T.fg_faint).pack(side="left")
+                     bg=T.panel2, fg=T.fg_faint).pack(side="left", padx=(0, 8))
+        if note.get("tasks"):
+            t_done, t_all, t_pct = note_progress(note)
+            tk.Label(meta, text=f"{t_done}/{t_all} tasks  •  {t_pct}%", font=self.font_tiny,
+                     bg=T.panel2, fg=T.ok if t_done == t_all else T.fg_faint
+                     ).pack(side="left")
         due = parse_dt(note.get("due", ""))
         if due:
             overdue = due < datetime.now()
@@ -1531,7 +2602,7 @@ class StickyNotesApp:
                      font=self.font_tiny, bg=T.panel2,
                      fg=T.err if overdue else T.fg_faint).pack(side="right")
 
-        tk.Label(body, text=(note.get("text", "").strip() or "(empty note)")[:180],
+        tk.Label(body, text=note_label(note)[:180],
                  font=self.font_note, bg=T.panel2, fg=T.fg, wraplength=300,
                  justify="left", anchor="w").pack(fill="x", pady=(3, 0))
 
@@ -1694,7 +2765,7 @@ class StickyNotesApp:
         n = self.get_note(nid)
         if not n:
             return
-        if confirm and (n.get("text") or "").strip():
+        if confirm and ((n.get("text") or "").strip() or n.get("tasks")):
             if not messagebox.askyesno("Delete note",
                                        "Delete this note permanently?\n\n"
                                        "(Archive keeps it and can be undone.)",
@@ -1783,7 +2854,8 @@ class StickyNotesApp:
                     return False
             if q:
                 hay = " ".join([n.get("text", ""), n.get("sender", ""),
-                                n.get("channel", ""), " ".join(n.get("tags", []))]).lower()
+                                n.get("channel", ""), " ".join(n.get("tags", [])),
+                                task_text(n)]).lower()
                 if q not in hay:
                     return False
             return True
@@ -1911,14 +2983,20 @@ class StickyNotesApp:
                  cursor="hand2").pack(side="right")
         top.winfo_children()[-1].bind("<Button-1>", lambda e: self._card_menu(e, nid))
 
-        preview = (note.get("text", "").strip() or "(click to add text)")
-        if len(preview) > 130:
-            preview = preview[:130].rstrip() + "…"
-        font = ("Segoe UI", 10, "overstrike") if is_done else self.font_note
-        body = tk.Label(card, text=preview, font=font, bg=col["bg"], fg=col["text"],
-                        wraplength=205, justify="left", anchor="nw", padx=9, pady=6)
-        body.pack(fill="both", expand=True)
-        click(body)
+        tasks = note.get("tasks") or []
+        text = note.get("text", "").strip()
+        if text or not tasks:
+            preview = text or "(click to add text)"
+            if len(preview) > 130:
+                preview = preview[:130].rstrip() + "…"
+            font = ("Segoe UI", 10, "overstrike") if is_done else self.font_note
+            body = tk.Label(card, text=preview, font=font, bg=col["bg"], fg=col["text"],
+                            wraplength=205, justify="left", anchor="nw", padx=9, pady=6)
+            body.pack(fill="both", expand=True)
+            click(body)
+        if tasks:
+            # a note that is only tasks lets them fill the card
+            self._card_tasks(card, note, col, click, fill_card=not text)
 
         foot_bits = []
         if is_mm:
@@ -1943,6 +3021,71 @@ class StickyNotesApp:
             tk.Label(qa, text="✓ Done", font=self.font_tiny, bg=col["header"],
                      fg="#1A1A1A", padx=8, pady=2, cursor="hand2").pack(side="left")
             qa.winfo_children()[-1].bind("<Button-1>", lambda e: self.mark_done(nid))
+
+    def _card_tasks(self, card, note, col, click, fill_card):
+        """Task summary on a card: what is still open, and overall progress."""
+        pal = task_palette(col)
+        bg = col["bg"]
+        done_n, total, pct = note_progress(note)
+
+        box = tk.Frame(card, bg=bg)
+        box.pack(fill="both" if fill_card else "x", expand=fill_card,
+                 padx=9, pady=(8 if fill_card else 0, 6))
+        click(box)
+
+        pending = [t for t in note["tasks"] if task_progress(t) < 100]
+        # most pressing first; the sort is stable, so your own order still
+        # decides between tasks of the same priority
+        pending.sort(key=lambda t: -t.get("priority", 1))
+        tinted = col is not DONE_COLOR           # a completed note stays grey
+        for t in pending[:3]:
+            row = tk.Frame(box, bg=bg)
+            row.pack(fill="x")
+            own = t.get("color") if tinted else None
+            edge = tk.Frame(row, width=3,
+                            bg=COLORS[own % len(COLORS)]["header"] if own is not None else bg)
+            edge.pack(side="left", fill="y", padx=(0, 3), pady=2)
+            click(edge)
+            title = t.get("title") or "Untitled task"
+            if len(title) > 30:
+                title = title[:30].rstrip() + "…"
+            right = tk.Label(row, text=task_status(t), font=self.font_tiny, bg=bg,
+                             fg=pal["dim"])
+            right.pack(side="right")
+            if t.get("priority", 1) != 1:
+                name, colour, badge = PRIORITIES[t["priority"]]
+                flag = tk.Label(row, text=badge or name[0], bg=colour, fg="#FFFFFF",
+                                font=("Segoe UI Semibold", 7), padx=3, pady=0)
+                flag.pack(side="right", padx=(4, 5))
+                click(flag)
+            # its own label: at the 8pt text size the half-filled glyph is a blob
+            mark = tk.Label(row, text="◐" if task_progress(t) else "○", bg=bg,
+                            fg=pal["ink"], font=("Segoe UI Symbol", 9), padx=0, pady=0)
+            mark.pack(side="left")
+            left = tk.Label(row, text=title, font=self.font_tiny, bg=bg, fg=pal["ink"],
+                            anchor="w")
+            left.pack(side="left", fill="x", expand=True)
+            for w in (row, mark, left, right):
+                click(w)
+        if len(pending) > 3:
+            more = tk.Label(box, text=f"+{len(pending) - 3} more", font=self.font_tiny,
+                            bg=bg, fg=pal["dim"], anchor="w")
+            more.pack(fill="x")
+            click(more)
+
+        bar = tk.Frame(box, bg=pal["track"], height=5)
+        bar.pack(fill="x", pady=(5, 3))
+        click(bar)
+        if pct:
+            fill = tk.Frame(bar, bg=pal["done"] if done_n == total else pal["fill"])
+            fill.place(x=0, y=0, relheight=1, relwidth=pct / 100)
+            click(fill)
+        cap = tk.Label(box, anchor="w", font=self.font_tiny, bg=bg,
+                       fg=pal["done"] if done_n == total else pal["dim"],
+                       text=(f"All {total} tasks complete" if done_n == total
+                             else f"{done_n}/{total} tasks  •  {pct}%"))
+        cap.pack(fill="x")
+        click(cap)
 
     def _card_menu(self, event, nid):
         n = self.get_note(nid)
@@ -2000,8 +3143,16 @@ class StickyNotesApp:
         p = tk.Toplevel(self.root)
         p.title("Note")
         p.configure(bg=T.panel)
-        p.geometry("520x520+{}+{}".format(self.root.winfo_x() + 140,
-                                          self.root.winfo_y() + 70))
+        # Tall enough for a task list, but never taller than the monitor the
+        # main window is on, and never hanging off its edge.
+        w, h = 560, 720
+        x, y = self.root.winfo_x() + 140, self.root.winfo_y() + 70
+        area = work_area(x, y)
+        if area:
+            h = max(420, min(h, area[3] - area[1] - 70))
+            x = max(area[0], min(x, area[2] - w - 16))
+            y = max(area[1], min(y, area[3] - h - 50))
+        p.geometry(f"{w}x{h}+{x}+{y}")
         p.minsize(420, 380)
         p.bind("<Escape>", lambda e: p.destroy())
         p.after(60, lambda: dark_titlebar(p))
@@ -2075,6 +3226,11 @@ class StickyNotesApp:
         if is_done:
             tk.Label(hdr, text="✓ Completed", font=("Segoe UI Semibold", 9),
                      bg=col["header"], fg="#0F4A2A").pack(side="right")
+
+        # Overall task progress: a thin bar under the header. paint_tabs()
+        # packs it in once the note has tasks and keeps it up to date.
+        prog_strip = tk.Frame(p, height=4)
+        prog_fill = tk.Frame(prog_strip)
 
         # buttons
         btns = tk.Frame(p, bg=T.panel, padx=18, pady=12)
@@ -2195,7 +3351,19 @@ class StickyNotesApp:
         # body
         wrap = tk.Frame(p, bg=col["bg"], padx=16, pady=12)
         wrap.pack(fill="both", expand=True)
-        txt = tk.Text(wrap, wrap="word", font=("Segoe UI", 11), bg=col["bg"],
+
+        # Note | Tasks switch. Both views live in `wrap`; only one is packed.
+        tabs = tk.Frame(wrap, bg=col["bg"])
+        tabs.pack(side="top", fill="x", pady=(0, 8))
+        tab_note = tk.Label(tabs, text="Note", padx=12, pady=3, cursor="hand2")
+        tab_note.pack(side="left")
+        tab_tasks = tk.Label(tabs, text="Tasks", padx=12, pady=3, cursor="hand2")
+        tab_tasks.pack(side="left", padx=(4, 0))
+        tab_sum = tk.Label(tabs, font=self.font_tiny)
+        tab_sum.pack(side="right")
+
+        text_view = tk.Frame(wrap, bg=col["bg"])
+        txt = tk.Text(text_view, wrap="word", font=("Segoe UI", 11), bg=col["bg"],
                       fg=col["text"], relief="flat", bd=0, padx=6, pady=6,
                       insertbackground=col["text"], undo=True,
                       selectbackground=col["header"], selectforeground="#1A1A1A")
@@ -2203,12 +3371,12 @@ class StickyNotesApp:
         txt.insert("1.0", note.get("text", ""))
         load_fmt(txt, note.get("fmt"))
 
-        # Toolbar goes into `wrap` before the Text is packed, so it sits above it.
+        # Toolbar goes into `text_view` before the Text is packed, so it sits above it.
         fmt_bar = None
         if not is_done:
-            fmt_bar = self._build_format_bar(wrap, txt, col, lambda: on_change())
+            fmt_bar = self._build_format_bar(text_view, txt, col, lambda: on_change())
 
-        tscroll = tk.Scrollbar(wrap, orient="vertical", command=txt.yview,
+        tscroll = tk.Scrollbar(text_view, orient="vertical", command=txt.yview,
                                relief="flat", bd=0, width=10,
                                bg=col["header"], troughcolor=col["bg"],
                                activebackground=col["header"],
@@ -2219,8 +3387,74 @@ class StickyNotesApp:
 
         if is_done:
             txt.config(state="disabled")
-        else:
-            txt.focus_set()
+
+        # ── tasks ──
+        def tasks_changed():
+            paint_tabs()
+            self.render_notes()
+
+        panel = TaskPanel(self, wrap, p, note, col, is_done, tasks_changed)
+        view = {"now": ""}
+
+        def paint_tabs():
+            """Tab chips, the summary beside them and the bar under the header."""
+            done_n, total, pct = note_progress(note)
+            pal = task_palette(col)
+            all_done = bool(total) and done_n == total
+            tab_tasks.config(text=f"Tasks  {done_n}/{total}" if total else "Tasks")
+            for lbl, key in ((tab_note, "text"), (tab_tasks, "tasks")):
+                on = view["now"] == key
+                lbl.config(bg=col["header"] if on else pal["surface"],
+                           fg=self._readable_on(col["header"]) if on else pal["dim"],
+                           font=("Segoe UI Semibold", 9) if on else self.font_small)
+            tab_sum.config(bg=col["bg"], fg=pal["done"] if all_done else pal["dim"],
+                           text="" if not total else
+                           "All tasks complete" if all_done else f"{pct}% complete")
+            if total:
+                head = col["header"]
+                prog_strip.config(bg=shade(head, 1.25 if is_dark(head) else 0.80))
+                prog_fill.config(bg="#1E7B4A" if all_done else
+                                 shade(head, 1.9 if is_dark(head) else 0.40))
+                if pct:
+                    prog_fill.place(x=0, y=0, relheight=1, relwidth=pct / 100)
+                else:
+                    prog_fill.place_forget()
+                if not prog_strip.winfo_manager():
+                    prog_strip.pack(fill="x", after=hdr)
+            else:
+                prog_strip.pack_forget()
+
+        def show_view(which, remember=True):
+            view["now"] = which
+            text_view.pack_forget()
+            panel.frame.pack_forget()
+            (panel.frame if which == "tasks" else text_view).pack(fill="both", expand=True)
+            paint_tabs()
+            if which == "tasks":
+                panel.focus_add()
+            elif not is_done:
+                txt.focus_set()
+            if remember and note.get("view") != which:
+                note["view"] = which
+                save_notes(self.notes)
+
+        tab_note.bind("<Button-1>", lambda e: show_view("text"))
+        tab_tasks.bind("<Button-1>", lambda e: show_view("tasks"))
+        # reopen on whichever tab the note was left on
+        show_view("tasks" if note.get("view") == "tasks" and note["tasks"] else "text",
+                  remember=False)
+
+        def on_destroy(e):
+            if e.widget is not p:
+                return
+            try:
+                # the task list may still own the wheel; cards may be stale
+                self.root.bind_all("<MouseWheel>", self._main_wheel)
+                self.root.after_idle(self.render_notes)
+            except Exception:
+                pass
+
+        p.bind("<Destroy>", on_destroy, add="+")
 
         def on_change(_=None):
             note["text"] = txt.get("1.0", "end-1c")
@@ -2259,6 +3493,10 @@ class StickyNotesApp:
                         w.config(bg=col["text"])
             pin_off = shade(col["header"], 0.88)
             apply_pin(persist=False)
+            tabs.config(bg=col["bg"])
+            text_view.config(bg=col["bg"])
+            panel.render()
+            paint_tabs()
 
         def recolour(ci):
             """Swap the note's colour without closing it - reopening threw away
@@ -2436,8 +3674,23 @@ class StickyNotesApp:
                         if n.get("tags"):
                             bits.append(" ".join("#" + t for t in n["tags"]))
                         suffix = f"  _({' | '.join(bits)})_" if bits else ""
-                        body = (n.get("text") or "(empty)").replace("\n", " ")
+                        body = (n.get("text") or
+                                ("(tasks)" if n.get("tasks") else "(empty)")).replace("\n", " ")
                         lines.append(f"- [{box}] {body}{suffix}")
+                        for t in n.get("tasks") or []:
+                            t_pct = task_progress(t)
+                            if t["mode"] == "stages":
+                                how = f"stage {t['stage']}/{len(t['stages'])}"
+                                if t["stage"] < len(t["stages"]):
+                                    how += f", next: {t['stages'][t['stage']]}"
+                            else:
+                                how = f"{t_pct}%"
+                            if t.get("priority", 1) != 1:
+                                how += f" | {PRIORITIES[t['priority']][0]}"
+                            lines.append(f"  - [{'x' if t_pct >= 100 else ' '}] "
+                                         f"{t['title'] or 'Untitled task'}  _({how})_")
+                            for pt in t["points"]:
+                                lines.append(f"    - {pt}")
                     lines.append("")
                 with open(path, "w", encoding="utf-8") as f:
                     f.write("\n".join(lines))
