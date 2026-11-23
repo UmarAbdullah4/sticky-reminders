@@ -229,7 +229,15 @@ try:
     asked, looked, answer = [], [], {"yes": True}
     mod.message_box = lambda text, question=False: (asked.append((question, text)), answer["yes"])[1]
     real_find, real_stop = mod.find_source_copy, mod.stop_processes
+    real_who = mod.SingleInstance.__dict__["who"]
     mod.find_source_copy = lambda: (looked.append(1), real_find())[1]
+    note = os.path.join(old_home, "This copy has been replaced.txt")
+    holder_script = os.path.join(OUT, "holds_the_doorbell.py")
+    write(holder_script, "import socket, sys, time\ns = socket.socket()\n"
+                         "s.bind(('127.0.0.1', int(sys.argv[1])))\ns.listen(1)\ntime.sleep(300)\n")
+
+    def who_says(text):
+        mod.SingleInstance.who = classmethod(lambda cls: text)
 
     class Guard:
         took_over = 0
@@ -238,70 +246,129 @@ try:
             Guard.took_over += 1
             return True
 
-    old_login_shortcut()
-    old = subprocess.Popen([sys.executable, standin])
+    def decision():
+        return mod.load_config().get("source_copy")
+
+    def fresh(shortcut=True):
+        """An installed copy that has never been started, beside an old copy."""
+        shutil.rmtree(new_home, ignore_errors=True)
+        for leftover in (mod.SHORTCUT_PATH, mod.SOURCE_SHORTCUT, standin + ".old", note):
+            if os.path.exists(leftover):
+                os.remove(leftover)
+        write(standin, "import time\ntime.sleep(300)\n")
+        if shortcut:
+            old_login_shortcut()
+        asked.clear()
+        looked.clear()
+        answer["yes"] = True
+
+    fresh(shortcut=False)
+    aside = mod.set_aside_source_copy(old_home)
+    check("setting the old copy aside renames its program file and leaves a note saying why",
+          aside == standin + ".old" and os.path.isfile(aside) and not os.path.exists(standin)
+          and "switched off" in read(note), aside)
+    fresh(shortcut=False)
+    os.makedirs(os.path.join(old_home, ".git"))
+    check("a developer's checkout is left alone, and so is a folder that does not hold the app",
+          mod.set_aside_source_copy(old_home) == "" and os.path.isfile(standin)
+          and mod.set_aside_source_copy(logins) == "" and mod.set_aside_source_copy("") == "")
+    os.rmdir(os.path.join(old_home, ".git"))
+
+    fresh()
+    started = [subprocess.Popen([sys.executable, standin]),
+               subprocess.Popen([sys.executable, holder_script, str(mod.SINGLE_INSTANCE_PORT)])]
+    old, holder = started
     try:
-        time.sleep(1.0)
+        time.sleep(1.5)
         found = real_find()
-        check("a copy run from source is found: its process, its login shortcut and its folder",
-              bool(found) and old.pid in found["pids"] and found["at_login"]
-              and found["folder"] == old_home, str(found))
+        check("a copy run from source is found by what it runs, and its folder with it",
+              bool(found) and old.pid in found["pids"] and found["folder"] == old_home, str(found))
+        check("...and a Python program answering the app's doorbell counts as one too",
+              bool(found) and holder.pid in found["pids"], str(found))
 
-        mod.stop_processes = lambda pids, wait=5.0: False
-        still = mod.settle_source_copy(Guard(), False)
-        check("if the old copy cannot be stopped, the app says so, changes nothing and will ask again",
-              still is False and [q for q, _ in asked] == [True, False] and "running now" in asked[0][1]
-              and old.poll() is None and os.path.exists(mod.SOURCE_SHORTCUT)
-              and not os.path.exists(mod.CONFIG_FILE) and Guard.took_over == 0, str(asked))
-        mod.stop_processes = real_stop
-
+        who_says("")                                          # an old copy does not know the question
         now_first = mod.settle_source_copy(Guard(), False)
         time.sleep(0.3)
         cfg = mod.load_config()
         check("on Yes the old copy is stopped and this one takes its place",
-              now_first is True and Guard.took_over == 1 and old.poll() is not None)
+              now_first is True and Guard.took_over == 1 and old.poll() is not None
+              and holder.poll() is not None and [q for q, _ in asked] == [True]
+              and "running now" in asked[0][1], str(asked))
         check("...its settings and sign-ins are carried over",
               cfg["trigger_word"] == "@todo" and cfg["password"] == "pw-from-the-old-copy"
-              and cfg.get("source_copy_settled") is True, str({k: cfg.get(k) for k in ("trigger_word",)}))
-        check("...and its start-at-login entry is replaced by this program's",
+              and cfg.get("source_copy") == "replaced", str(cfg.get("source_copy")))
+        check("...its start-at-login entry is replaced by this program's",
               not os.path.exists(mod.SOURCE_SHORTCUT) and os.path.exists(mod.SHORTCUT_PATH))
+        check("...and it is switched off: its program file is renamed, so nothing can start it again",
+              not os.path.exists(standin) and os.path.isfile(standin + ".old") and os.path.isfile(note))
         check("stopping a process that has already gone is not an error", real_stop([old.pid]) is True)
 
         asked.clear()
         looked.clear()
-        check("once settled, it is never looked for or asked about again",
+        check("after that, an ordinary start does not look or ask",
+              mod.settle_source_copy(Guard(), True) is True and asked == [] and looked == [])
+        who_says(f"{mod.APP_VERSION} packaged")
+        check("...and a second launch of this same program is told apart without a search",
               mod.settle_source_copy(Guard(), False) is False and asked == [] and looked == [])
-    finally:
-        if old.poll() is None:
-            old.kill()
 
-    # only the login shortcut is left (the old copy is not running), and the answer is No
-    shutil.rmtree(new_home)
-    os.remove(mod.SHORTCUT_PATH)
-    old_login_shortcut()
+        # the old copy is back and running (its file restored by hand, say)
+        write(standin, "import time\ntime.sleep(300)\n")
+        started.append(subprocess.Popen([sys.executable, standin]))
+        time.sleep(1.0)
+        who_says("")
+        took = Guard.took_over
+        check("if the old copy turns up running again, it is stopped and set aside again, unasked",
+              mod.settle_source_copy(Guard(), False) is True and started[-1].poll() is not None
+              and Guard.took_over == took + 1 and asked == [] and not os.path.exists(standin))
+
+        # a copy that cannot be stopped (started as administrator)
+        fresh()
+        started.append(subprocess.Popen([sys.executable, standin]))
+        time.sleep(1.0)
+        took = Guard.took_over
+        mod.stop_processes = lambda pids, wait=5.0: False
+        result = mod.settle_source_copy(Guard(), False)
+        mod.stop_processes = real_stop
+        check("an old copy that Windows will not let the app stop is reported, with what to do",
+              result is False and Guard.took_over == took and [q for q, _ in asked] == [True, False]
+              and "still running" in asked[1][1] and "will not come back" in asked[1][1]
+              and decision() == "replaced" and not os.path.exists(standin)
+              and started[-1].poll() is None, str(asked))
+    finally:
+        mod.stop_processes = real_stop
+        for p in started:
+            if p.poll() is None:
+                p.kill()
+
+    # the old copy is not running, only set to start at login - and the answer is No
+    fresh()
     answer["yes"] = False
     first = mod.settle_source_copy(Guard(), True)
-    cfg = mod.load_config()
-    check("on No nothing is touched, and the question is asked only that once",
+    check("on No nothing is touched, and it is never looked for or asked about again",
           first is True and len(asked) == 1 and "running now" not in asked[0][1]
           and os.path.exists(mod.SOURCE_SHORTCUT) and not os.path.exists(mod.SHORTCUT_PATH)
-          and cfg["trigger_word"] == "@reminder" and cfg.get("source_copy_settled") is True
-          and mod.settle_source_copy(Guard(), True) is True and len(asked) == 1, str(asked))
+          and os.path.isfile(standin) and decision() == "kept"
+          and mod.load_config()["trigger_word"] == "@reminder"
+          and mod.settle_source_copy(Guard(), False) is False and len(asked) == 1 and looked == [1],
+          str((asked, looked)))
 
-    shutil.rmtree(new_home)
-    answer["yes"] = True
+    fresh()
     first = mod.settle_source_copy(Guard(), True)
     check("with the old copy not running, its folder is read from its login shortcut",
-          first is True and mod.load_config()["trigger_word"] == "@todo"
+          first is True and mod.load_config()["trigger_word"] == "@todo" and decision() == "replaced"
           and not os.path.exists(mod.SOURCE_SHORTCUT) and os.path.exists(mod.SHORTCUT_PATH)
-          and Guard.took_over == 1)
+          and os.path.isfile(standin + ".old") and len(asked) == 1, str(asked))
 
-    shutil.rmtree(new_home)
-    asked.clear()
-    looked.clear()
-    check("a PC with no sign of an old copy is not searched and nobody is asked anything",
+    fresh(shortcut=False)
+    check("a PC with no sign of an old copy is not searched, asked, or written to",
           mod.settle_source_copy(Guard(), True) is True and asked == [] and looked == []
-          and mod.load_config().get("source_copy_settled") is True)
+          and not os.path.exists(mod.CONFIG_FILE))
+    who_says("")
+    check("something else in the app's place is searched for once, and not mistaken for an old copy",
+          mod.settle_source_copy(Guard(), False) is False and asked == [] and looked == [1]
+          and os.path.isfile(standin))
+    setattr(mod.SingleInstance, "who", real_who)
+    mod.find_source_copy = real_find
     mod.CONFIG_DIR, mod.CONFIG_FILE = harness_config
 
     # ── single instance ──
@@ -317,9 +384,13 @@ try:
         c.sendall(b"GET / HTTP/1.0\r\n\r\n")
         time.sleep(0.3)
     check("a stray connection does not pop the window", shown == [1])
+    check("a running copy says what it is when asked, without showing itself",
+          mod.SingleInstance.who() == f"{mod.APP_VERSION} source" and (time.sleep(0.2) or shown == [1]),
+          str(shown))
     # the first copy goes away (as when the installed program stops an old copy)
     a.sock.close()
     b.on_show = lambda: shown.append("b")
+    check("with nothing listening, the question simply goes unanswered", mod.SingleInstance.who() == "")
     check("after the first copy has gone, the second can take its place and answer the doorbell",
           b.take_over(wait=3) is True and mod.SingleInstance.signal_existing() is True
           and (time.sleep(0.2) or shown == [1, "b"]), str(shown))

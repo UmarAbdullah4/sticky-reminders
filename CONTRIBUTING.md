@@ -76,10 +76,12 @@ python tests/test_installer.py
 
 installs that Setup file silently into a scratch folder, checks the entry in
 Windows' installed apps and the shortcuts, installs over the top, runs the
-installed program's self-test and uninstalls again. Neither download is
-code-signed, so on a PC with Smart App Control switched on Windows refuses to
-run the Setup file and the test says it could not run. CI has no such policy
-and runs it on every push.
+installed program's self-test and uninstalls again.
+
+Neither download is code-signed. On a PC with Smart App Control switched on,
+Windows may therefore refuse to run the packed program, in which case the build
+stops at its self-test, or the Setup file, in which case the install test says
+it could not run. CI has no such policy and does both on every push.
 
 Things to keep in mind when changing how the app is packaged:
 

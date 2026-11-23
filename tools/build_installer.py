@@ -129,7 +129,14 @@ def main():
     print("\n[2/3] Asking the packed program to test itself...")
     probe = os.path.join(BUILD, "selftest")
     shutil.rmtree(probe, ignore_errors=True)
-    code = subprocess.run([exe, "--self-test", probe], timeout=180).returncode
+    try:
+        code = subprocess.run([exe, "--self-test", probe], timeout=180).returncode
+    except OSError as e:
+        if getattr(e, "winerror", None) != 4551:      # "An Application Control policy has blocked this file"
+            raise
+        sys.exit("\nFAILED: Windows on this PC refuses to run the packed program (Smart App Control\n"
+                 "or another application control policy), so it cannot be tested here. Nothing was\n"
+                 "left in dist/. Build on a PC without that policy, or let CI build it.")
     try:
         report = json.load(open(os.path.join(probe, "self_test.json"), encoding="utf-8"))
     except OSError:

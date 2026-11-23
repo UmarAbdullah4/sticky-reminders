@@ -9,6 +9,18 @@ new features, **patch** for fixes.
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-11-23
+
+### Fixed
+- Taking over from a copy run with Python is now final. The old copy's program
+  file is renamed to `sticky_reminders.pyw.old`, so nothing can start it again.
+  Before, the hourly scheduled task that the first setup script created started
+  the old copy at every login, and the installed program then handed over to it.
+- If the old copy is found running again after it was replaced, the installed
+  program stops it and carries on.
+- An old copy that Windows will not let the app stop, because it was started as
+  administrator, is now noticed and reported with what to do about it.
+
 ## [2.4.0] - 2026-11-23
 
 ### Added
@@ -147,7 +159,8 @@ The first version, "Sticky Notes Reminder".
   confirmation back to the channel.
 - Start with Windows.
 
-[Unreleased]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.4.0...HEAD
+[Unreleased]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.4.1...HEAD
+[2.4.1]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.3.1...v2.4.0
 [2.3.1]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.2.0...v2.3.0

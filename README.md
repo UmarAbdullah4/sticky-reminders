@@ -77,16 +77,17 @@ your Windows account only, so it asks for no administrator password. You get
 Start menu and desktop shortcuts and the option to start with Windows, and you
 remove it again under **Settings → Apps**. Python is not needed.
 
-The Setup file is not code-signed yet, so Windows is cautious the first time:
-
-- **"Windows protected your PC"**: choose **More info**, then **Run anyway**.
-- **"Smart App Control blocked an app that may be unsafe"**: that Windows
-  setting makes no exceptions for unsigned installers. Use the portable zip or
-  run from source instead.
-
 **Portable.** Download `StickyReminders-x.y.z-portable.zip`, unzip it anywhere
 and run `StickyReminders.exe`. Nothing is installed; delete the folder to
 remove it.
+
+Neither download is code-signed yet, so Windows is cautious the first time:
+
+- **"Windows protected your PC"**: choose **More info**, then **Run anyway**.
+- **"Smart App Control blocked an app that may be unsafe"**: that Windows
+  setting makes no exceptions for unsigned programs, and there is no button to
+  get past it. It can block the Setup file, and sometimes the program itself.
+  On such a PC, run from source.
 
 **From source.** See [Running from source](#running-from-source).
 
@@ -98,8 +99,23 @@ are kept, as they are when you uninstall.
 If an earlier version is running with Python on the PC, the installed version
 offers to take over the first time it starts. Say yes and it stops the old copy,
 carries your settings and sign-ins across, and takes over starting with
-Windows. Both use the same notes file, so your notes are simply there. The old
-folder can be deleted afterwards.
+Windows. Both use the same notes file, so your notes are simply there.
+
+The old copy is also switched off: its program file is renamed to
+`sticky_reminders.pyw.old`, so that no shortcut or scheduled task can start it
+again. The old folder can be deleted afterwards.
+
+If the old copy was set up with `setup_sticky_reminders.ps1`, an hourly
+scheduled task is left behind. It no longer does anything. To remove it, run
+this once in a terminal opened as administrator:
+
+```
+schtasks /Delete /TN StickyReminders_HourlyReminder /F
+```
+
+If the app says the old copy is still running and could not be stopped, that
+copy was started as administrator. Quit it from its tray icon, or sign out of
+Windows and back in, and start Sticky Reminders again.
 
 ## Running from source
 

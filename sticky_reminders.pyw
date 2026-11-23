@@ -1,11 +1,17 @@
 """
-Sticky Reminders  -  v2.4.0
+Sticky Reminders  -  v2.4.1
 ===========================
 A desktop sticky-notes + reminder app. Messages from Mattermost, Slack,
 Discord and Telegram can become notes, and marking a note done replies in
 the thread it came from.
 
 The full history is in CHANGELOG.md. Recent versions:
+
+What changed in v2.4.1:
+  * Taking over from a copy run with Python is now final: the old copy's
+    program file is renamed, so nothing can start it again - including the
+    hourly scheduled task of the first setup script, which used to bring the
+    old version back after a restart
 
 What changed in v2.4.0:
   * Can be installed like any Windows program: a Setup file with Start menu
@@ -96,7 +102,7 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 APP_NAME = "Sticky Reminders"
 # The one place the version lives. Releases are tagged v<this> and described
 # in CHANGELOG.md; tools/release_notes.py checks that all three agree.
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.4.1"
 # The project's home. Sent to the chat services as part of the User-Agent.
 APP_HOMEPAGE = "https://github.com/UmarAbdullah4/sticky-reminders"
 
@@ -921,16 +927,19 @@ def source_script(command_line):
 
 
 def find_source_copy():
-    """Signs of a copy of this app run from source on this PC: the processes
-    of one running now, whether one starts at login, and the folder it lives
-    in ('' if that cannot be told). None if there is no sign of one."""
+    """A copy of this app run from source, as far as it can be seen: the
+    processes of one running now, and the folder it lives in ('' if that
+    cannot be told). None if the PC could not be searched."""
     lnk = SOURCE_SHORTCUT.replace("'", "''")
     ps = ("[Console]::OutputEncoding=New-Object Text.UTF8Encoding $false;"
-          "$r=@{procs=@();lnk=''};"
+          "$r=@{procs=@();lnk='';listener=0};"
           "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | ForEach-Object "
           "{$r.procs+=@{pid=[int]$_.ProcessId;cmd=[string]$_.CommandLine}};"
           f"if(Test-Path -LiteralPath '{lnk}')"
           f"{{$r.lnk=[string](New-Object -COM WScript.Shell).CreateShortcut('{lnk}').Arguments}};"
+          f"$l=Get-NetTCPConnection -LocalPort {SINGLE_INSTANCE_PORT} -State Listen "
+          "-ErrorAction SilentlyContinue | Select-Object -First 1;"
+          "if($l){$r.listener=[int]$l.OwningProcess};"
           "ConvertTo-Json $r -Depth 4 -Compress")
     try:
         done = run_hidden(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
@@ -939,14 +948,20 @@ def find_source_copy():
     except Exception as e:
         log.warning("Could not look for a copy run from source: %s", e)
         return None
-    running = [(int(p["pid"]), source_script(p.get("cmd") or "")) for p in seen.get("procs") or []]
+    procs = seen.get("procs") or []
+    running = [(int(p["pid"]), source_script(p.get("cmd") or "")) for p in procs]
     running = [(pid, script) for pid, script in running if script]
-    at_login = os.path.exists(SOURCE_SHORTCUT)
-    if not running and not at_login:
-        return None
+    pids = [pid for pid, _ in running]
+    # Whatever answers the app's doorbell, if it is a Python program other
+    # than this one, is a copy of the app too. That finds a copy whose command
+    # line cannot be read because it was started as administrator.
+    listener = int(seen.get("listener") or 0)
+    if (listener and listener != os.getpid() and listener not in pids
+            and any(int(p["pid"]) == listener for p in procs)):
+        pids.append(listener)
     scripts = [s for _, s in running] + [source_script("python " + (seen.get("lnk") or "")) or ""]
     folder = next((os.path.dirname(s) for s in scripts if os.path.isabs(s)), "")
-    return {"pids": [pid for pid, _ in running], "at_login": at_login, "folder": folder}
+    return {"pids": pids, "folder": folder}
 
 
 def stop_processes(pids, wait=5.0):
@@ -971,50 +986,96 @@ def stop_processes(pids, wait=5.0):
     return gone
 
 
+def set_aside_source_copy(folder):
+    """Rename the old copy's program file, so that nothing can start that copy
+    again: not a shortcut, not a double-click, and not the hourly scheduled
+    task the first setup script registered (which only an administrator could
+    delete). A developer's checkout is left alone. Returns the new path, or ''."""
+    script = os.path.join(folder, SOURCE_SCRIPT) if folder else ""
+    if not script or not os.path.isfile(script) or os.path.exists(os.path.join(folder, ".git")):
+        return ""
+    aside = script + ".old"
+    try:
+        os.replace(script, aside)
+        with open(os.path.join(folder, "This copy has been replaced.txt"), "w",
+                  encoding="utf-8") as f:
+            f.write(f"{APP_NAME} is now installed on this PC as a program (see the Start menu).\n"
+                    f"This older copy, which ran with Python, was switched off on "
+                    f"{datetime.now():%d %B %Y}.\n\n"
+                    f"Its program file was renamed to {os.path.basename(aside)} so that nothing "
+                    "starts it by accident.\nYour notes were never kept in this folder and are "
+                    "untouched. Your settings were copied to the installed version.\n\n"
+                    "You can delete this folder.\n")
+        log.info("Set aside the copy run from source in %s", folder)
+        return aside
+    except OSError as e:
+        log.error("Could not set the old copy aside: %s", e)
+        return ""
+
+
 def settle_source_copy(guard, first):
-    """For the installed program, until it has been settled once: if a copy
-    run from source is on this PC, offer to take over from it - stop it,
-    bring its settings across, and move its start-at-login entry here.
+    """For the installed program: if a copy run from source is on this PC,
+    offer - once - to take over from it: stop it, bring its settings across,
+    move its start-at-login entry here and switch it off for good.
     `first` says whether this is the only copy running; returns the same,
     as it stands afterwards."""
     config = load_config()
-    if config.get("source_copy_settled"):
+    decision = config.get("source_copy", "")          # "" until asked, then "replaced" or "kept"
+    if decision == "kept":
         return first
-    # Nothing running and nothing set to start: there is no copy to look for.
-    found = find_source_copy() if (not first or os.path.exists(SOURCE_SHORTCUT)) else None
-    replace = bool(found) and message_box(
-        "An older copy of Sticky Reminders - the one that runs with Python - is on this PC"
-        + (", and it is running now" if found["pids"] else "") + ".\n\n"
-        "Use this installed version from now on?\n\n"
-        "Yes: the old copy is stopped and no longer starts with Windows. Your notes stay "
-        "exactly as they are, and your settings and sign-ins are carried over.\n\n"
-        "No: keep the old copy. You will not be asked again.", question=True)
-    if replace and not stop_processes(found["pids"]):
-        message_box("The old copy of Sticky Reminders could not be stopped.\n\n"
-                    "Quit it from its icon near the clock (right-click, Quit), then start "
-                    "Sticky Reminders again.")
-        return first                                  # nothing settled: ask again next time
-    if replace:
-        old = os.path.join(found["folder"], "config.json") if found["folder"] else ""
-        if old and os.path.isfile(old) and not os.path.exists(CONFIG_FILE):
-            try:
-                os.makedirs(CONFIG_DIR, exist_ok=True)
-                shutil.copy2(old, CONFIG_FILE)        # credentials in it are encrypted for this
-                config = load_config()                # Windows account, so they still open here
-                log.info("Settings carried over from %s", found["folder"])
-            except Exception as e:
-                log.error("Could not carry the settings over: %s", e)
-        if found["at_login"]:
-            try:
-                os.remove(SOURCE_SHORTCUT)
-                if not startup_enabled():
-                    set_startup(True)
-            except Exception as e:
-                log.error("Could not move the start-at-login entry: %s", e)
-        if found["pids"] and not first:
-            first = guard.take_over()
-    config["source_copy_settled"] = True
+    at_login = os.path.exists(SOURCE_SHORTCUT)
+    # Something else is running: another copy of this very program says so
+    # when asked. A copy run from source says "source", or - before 2.4.1 -
+    # does not know the question.
+    if (first and not at_login) or (not first and "packaged" in SingleInstance.who()):
+        return first
+    found = find_source_copy() or {"pids": [], "folder": ""}
+    if not found["pids"] and not at_login:
+        return first                                  # no sign of one after all
+    if decision != "replaced":
+        if not message_box(
+                "An older copy of Sticky Reminders - the one that runs with Python - is on this PC"
+                + (", and it is running now" if found["pids"] else "") + ".\n\n"
+                "Use this installed version from now on?\n\n"
+                "Yes: the old copy is stopped and switched off, so that it no longer starts "
+                "with Windows or on its own. Your notes stay exactly as they are, and your "
+                "settings and sign-ins are carried over.\n\n"
+                "No: keep using the old copy. You will not be asked again.", question=True):
+            config["source_copy"] = "kept"
+            save_config(config)
+            return first
+
+    # Take over. Also the path taken, without asking, whenever the old copy
+    # turns up again after the answer was Yes.
+    stopped = stop_processes(found["pids"])
+    old = os.path.join(found["folder"], "config.json") if found["folder"] else ""
+    if old and os.path.isfile(old) and not os.path.exists(CONFIG_FILE):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            shutil.copy2(old, CONFIG_FILE)            # credentials in it are encrypted for this
+            config = load_config()                    # Windows account, so they still open here
+            log.info("Settings carried over from %s", found["folder"])
+        except Exception as e:
+            log.error("Could not carry the settings over: %s", e)
+    config["source_copy"] = "replaced"
     save_config(config)
+    if at_login:
+        try:
+            os.remove(SOURCE_SHORTCUT)
+            if not startup_enabled():
+                set_startup(True)
+        except Exception as e:
+            log.error("Could not move the start-at-login entry: %s", e)
+    aside = set_aside_source_copy(found["folder"])
+    if found["pids"] and not first:
+        first = stopped and guard.take_over()
+        if not first:
+            message_box("The old copy of Sticky Reminders is still running, and Windows did "
+                        "not let this program stop it.\n\n"
+                        "Quit it from its icon near the clock (right-click, then Quit), or "
+                        "sign out of Windows and back in. Then start Sticky Reminders again."
+                        + ("\n\nIt has been switched off, so after that it will not come back."
+                           if aside else ""))
     return first
 
 
@@ -1030,6 +1091,7 @@ class SingleInstance:
 
     MUTEX = "Local\\StickyReminders.SingleInstance"
     HELLO = b"sticky-reminders:show\n"
+    WHO = b"sticky-reminders:who\n"      # since 2.4.1; older copies do not answer it
     ALREADY_EXISTS = 183
 
     def __init__(self, on_show):
@@ -1089,9 +1151,13 @@ class SingleInstance:
                 return
             try:
                 conn.settimeout(1.0)
-                if conn.recv(64) == self.HELLO:     # ignore port scanners and strays
+                said = conn.recv(64)
+                if said == self.HELLO:              # ignore port scanners and strays
                     conn.sendall(b"ok\n")
                     self.on_show()
+                elif said == self.WHO:
+                    kind = "packaged" if FROZEN else "source"
+                    conn.sendall(f"{APP_VERSION} {kind}\n".encode("ascii"))
             except Exception:
                 pass
             finally:
@@ -1109,6 +1175,18 @@ class SingleInstance:
                 return c.recv(16) == b"ok\n"
         except Exception:
             return False
+
+    @classmethod
+    def who(cls):
+        """What the copy that is already running says it is: '2.4.1 packaged'
+        or '2.4.1 source' - or '' from a version too old to know the question."""
+        try:
+            with socket.create_connection(("127.0.0.1", SINGLE_INSTANCE_PORT),
+                                          timeout=2) as c:
+                c.sendall(cls.WHO)
+                return c.recv(64).decode("ascii", "replace").strip()
+        except Exception:
+            return ""
 
 
 # ═══════════════════════════════════════════════════════
