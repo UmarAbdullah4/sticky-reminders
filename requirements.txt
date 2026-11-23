@@ -6,3 +6,5 @@ pystray>=0.19       # system tray icon
 pillow>=9.0         # draws the tray icon (needed together with pystray)
 anthropic>=2.0      # the Claude option of the assistant (OpenAI, Gemini and
                     # open-source endpoints need nothing extra)
+pypdf>=4.0          # lets the assistant read PDF files named in a note's Context
+                    # (text files, code and Word documents need nothing extra)

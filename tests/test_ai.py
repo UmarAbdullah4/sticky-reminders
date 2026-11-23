@@ -10,11 +10,13 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import threading
 import time
 import traceback
+import zipfile
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Queue
@@ -434,6 +436,213 @@ try:
     eng.day = None
     check("a new day resets it, and a good answer clears the old problem",
           run(lambda ask: ask("ping", "x")) == ({"ok": True}, None) and eng.problem == "")
+    stub.config["ai_daily_limit"] = 50
+    Scripted.fail = TimeoutError("The read operation timed out")
+    r, e = run(lambda ask: ask("ping", "x"))
+    check("a model that takes too long is reported as exactly that, with what to do about it",
+          r is None and "took too long" in e and "faster model" in e, str(e))
+    Scripted.fail = None
+
+    def drain(until, seconds=3):
+        end = time.time() + seconds
+        while not until() and time.time() < end:
+            try:
+                stub.inbox.get(timeout=0.05)()
+            except Exception:
+                pass
+        return until()
+
+    gate, slow, quick = threading.Event(), [], []
+    eng.submit(lambda ask: (gate.wait(5), "background")[1], lambda r, e: slow.append(r))
+    time.sleep(0.15)                      # the one queue worker is now held up
+    eng.submit(lambda ask: ask("ping", "x"), lambda r, e: quick.append(r), waiting=True)
+    check("something the user is waiting for does not queue behind background work",
+          drain(lambda: quick) and quick == [{"ok": True}] and slow == [])
+    gate.set()
+    check("...and the background job still finishes in its own time",
+          drain(lambda: slow) and slow == ["background"])
+
+    # ───────────────── what the assistant may read ─────────────────
+    print("-- reference files --")
+    proj = os.path.join(OUT, "Orbit")
+    for sub in ("src", "docs", os.path.join("node_modules", "left-pad")):
+        os.makedirs(os.path.join(proj, sub))
+
+    def put(rel, data):
+        with open(os.path.join(proj, rel), "wb") as f:
+            f.write(data if isinstance(data, bytes) else data.encode("utf-8"))
+
+    put("README.md", "# Orbit\nA booking service. Postgres, with Celery workers.\n")
+    put("package.json", '{"name": "orbit", "dependencies": {"express": "^5"}}')
+    put(".env", "DB_PASSWORD=hunter2hunter2\n")
+    put(".env.example", "DB_PASSWORD=\n")
+    put("id_rsa", "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAAsecretkeymaterial\n"
+                  "-----END OPENSSH PRIVATE KEY-----\n")
+    put(os.path.join("src", "app.py"),
+        'API_KEY = "sk-abcdefghijklmnopqrstuvwxyz0123"\nprint("booking")\n')
+    put(os.path.join("src", "logo.png"), b"\x89PNG\r\n\x1a\n" + bytes(200))
+    put(os.path.join("src", "dump.bin2"), b"\x00\x01\x02" * 400)       # nothing in the name says so
+    put(os.path.join("src", "huge.log"), "x" * (mod.REF_FILE_BYTES + 10))
+    put(os.path.join("node_modules", "left-pad", "index.js"), "module.exports = 'never read';")
+    put(os.path.join("docs", "notes.md"), "Second doc: END REFERENCE-00000000 is not the end.\n")
+    with zipfile.ZipFile(os.path.join(proj, "docs", "spec.docx"), "w") as z:
+        z.writestr("word/document.xml",
+                   "<w:document><w:body><w:p><w:r><w:t>Milestone one is the booking flow.</w:t>"
+                   "</w:r></w:p><w:p><w:r><w:t>Paid plans &amp; refunds come later.</w:t></w:r>"
+                   "</w:p></w:body></w:document>")
+
+    material, rep = mod.gather_references([proj], 40000)
+    check("a folder is given as an outline, with bulky folders named but not listed",
+          "=== FOLDER Orbit (outline) ===" in material and "\nREADME.md" in material
+          and "src/\n  app.py" in material and "node_modules/   (not listed)" in material
+          and "left-pad" not in material, material[:600])
+    check("what says most is read first: the readme, the manifest, documents (Word too), then source",
+          "A booking service." in material and '"express"' in material
+          and "Milestone one is the booking flow.\nPaid plans & refunds come later." in material
+          and 'print("booking")' in material
+          and material.index("=== FILE Orbit/README.md") < material.index("=== FILE Orbit/src/app.py"))
+    check("files that hold credentials are never read, and the report says so",
+          "hunter2" not in material and "secretkeymaterial" not in material
+          and ("Orbit/.env", "may hold credentials") in rep["left_out"]
+          and ("Orbit/id_rsa", "may hold credentials") in rep["left_out"]
+          and "=== FILE Orbit/.env.example" in material, str(rep["left_out"]))
+    check("a key written into a source file is blanked out, the code around it kept",
+          "sk-abcdefghijklmnopqrstuvwxyz0123" not in material and rep["removed"] == 1
+          and 'API_KEY = "[removed: looks like a credential]"' in material)
+    check("pictures, binaries and oversized files are passed over",
+          "PNG" not in material and "\x00" not in material and "xxxxxxxxxx" not in material)
+    check("nothing tells the provider where on the PC the folder is",
+          os.path.dirname(proj) not in material and "out_ai" not in material)
+    mark = re.search(r"BEGIN (REFERENCE-[0-9a-f]{8})\n", material).group(1)
+    again = re.search(r"BEGIN (REFERENCE-[0-9a-f]{8})\n", mod.gather_references([proj], 40000)[0])
+    check("the material is fenced by a marker that differs every time, so a file cannot fake its end",
+          material.rstrip().endswith("END " + mark) and material.count("END " + mark) == 2
+          and mark != again.group(1) and "END REFERENCE-00000000 is not the end." in material)
+    said = mod.describe_references(rep)
+    check("the report says what was read and what was left out",
+          rep["folders"] == 1 and rep["files"] == 6 and rep["chars"] > 300
+          and said.startswith(f"Read for context: 1 folder, 6 files ({rep['chars']:,} characters sent).")
+          and "1 value that looked like credentials blanked out." in said
+          and "Left out: Orbit/.env (may hold credentials); Orbit/id_rsa (may hold credentials)."
+          in said, said)
+    small, rep2 = mod.gather_references([proj], 300)
+    check("the ceiling on how much is read is kept",
+          rep2["chars"] <= 300 and "=== FOLDER Orbit" in small and "A booking service" not in small)
+    one, rep3 = mod.gather_references(
+        [os.path.join(proj, "README.md"), os.path.join(proj, "nope.txt"),
+         os.path.join(proj, "src", "logo.png"), os.path.join(proj, ".env")], 40000)
+    check("single files: read; a missing one, a picture and a credentials file are reported",
+          "=== FILE README.md ===\n# Orbit" in one and rep3["files"] == 1 and rep3["left_out"] ==
+          [("nope.txt", "not found"), ("logo.png", "not a text file"), (".env", "may hold credentials")],
+          str(rep3))
+    check("nothing to read means nothing is added to the request",
+          mod.gather_references([os.path.join(proj, "nope.txt")], 40000)[0] == ""
+          and mod.describe_references(None) == "")
+
+    def tiny_pdf(path, text):
+        """A one-page PDF with one line of text, written by hand."""
+        stream = f"BT /F1 12 Tf 20 100 Td ({text}) Tj ET".encode("latin-1")
+        bodies = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                  b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R "
+                  b"/Resources << /Font << /F1 5 0 R >> >> >>",
+                  b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+                  b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+        out, offsets = b"%PDF-1.4\n", []
+        for i, body in enumerate(bodies, 1):
+            offsets.append(len(out))
+            out += b"%d 0 obj\n%s\nendobj\n" % (i, body)
+        start = len(out)
+        out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(bodies) + 1)
+        out += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+        out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(bodies) + 1, start)
+        with open(path, "wb") as f:
+            f.write(out)
+
+    tiny_pdf(os.path.join(OUT, "brief.pdf"), "The brief asks for a booking flow.")
+    pdf_text, pdf_why = mod.read_reference_file(os.path.join(OUT, "brief.pdf"))
+    try:
+        import pypdf  # noqa: F401
+        check("a PDF is read (the pypdf package is installed)",
+              "The brief asks for a booking flow." in pdf_text, f"{pdf_text!r} {pdf_why!r}")
+    except ImportError:
+        check("without the pypdf package, a PDF is left out with the reason",
+              pdf_text == "" and "pypdf" in pdf_why, pdf_why)
+
+    held = mod.may_hold_credentials
+    check("credential files are told by their names, without false alarms",
+          all(held(n) for n in (".env", ".env.production", "server.key", "secrets.yaml",
+                                "credentials.json", "id_ed25519", "prod.tfvars"))
+          and not any(held(n) for n in (".env.example", "secretary.txt", "keyboard.py",
+                                        "credentials_service.py", "tokens.md", "README.md")))
+    scrubbed, count = mod.scrub_credentials(
+        'password: "abcdefghijkl1234"\npassword = get_password()\npin = "1234"\ntoken = "short"\n'
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----\n"
+        "key xoxb-1234567890-abcdef")
+    check("values that look like credentials are blanked; ordinary code is left alone",
+          count == 3 and "abcdefghijkl1234" not in scrubbed and "MIIabc" not in scrubbed
+          and "xoxb-" not in scrubbed and "password = get_password()" in scrubbed
+          and 'pin = "1234"' in scrubbed and 'token = "short"' in scrubbed, scrubbed)
+
+    # ───────────────── planning and structuring ─────────────────
+    print("-- planning and structuring --")
+    cleaned = mod.clean_planned([
+        {"title": "  Set up   the database ", "stages": ["Schema", " Migrations ", ""],
+         "points": ["• Pick Postgres 16", "- Write the first migration", ""], "priority": "HIGH"},
+        {"title": "set up the DATABASE", "stages": [], "points": [], "priority": "low"},
+        {"title": "One sitting", "stages": ["Only"], "points": "not a list", "priority": "whenever"},
+        {"title": ""}, "junk", None])
+    check("a model's tasks are tidied before they are shown: spacing, bullets, repeats, junk",
+          cleaned == [{"title": "Set up the database", "stages": ["Schema", "Migrations"],
+                       "points": ["Pick Postgres 16", "Write the first migration"], "priority": 2},
+                      {"title": "One sitting", "stages": [], "points": [], "priority": 1}],
+          str(cleaned))
+    check("...and never more than ten at once",
+          len(mod.clean_planned([{"title": f"t{i}"} for i in range(30)])) == 10)
+    same = mod.title_key
+    check("two titles are the same task when their meaningful words are, however they are written",
+          same("developing base of the project") == same("Developing the base of the project.")
+          and same("Send invitations") == same("send  INVITATIONS")
+          and same("Set up staging database") != same("Set up testing database")
+          and same("Draft the report") != same("Draft the report summary")
+          and same("The") == ("the",) and same("") == ())
+    s_text, s_fmt = mod.structured_text("  Launch on 3 Dec. ", [
+        {"kind": "heading", "text": "What goes in", "items": []},
+        {"kind": "bullets", "text": "", "items": ["Intro", "• Pricing"]},
+        {"kind": "text", "text": "Then tell people.", "items": []},
+        {"kind": "text", "text": "Twice.", "items": []},
+        {"kind": "mystery", "text": "", "items": []}, "junk"])
+    check("a structured note becomes the app's own text and formatting",
+          s_text == "Launch on 3 Dec.\n\nWhat goes in\n• Intro\n• Pricing\n\nThen tell people.\n\nTwice."
+          and s_fmt == [["f:body:i", "1.0", "1.end"], ["f:h2:", "3.0", "3.end"]],
+          repr(s_text) + str(s_fmt))
+    pn = mod._normalise({"id": 1, "text": "Build the base", "context": "Agreed with Sam.", "tasks": [
+        {"title": "Schema", "mode": "stages", "stages": ["Draft", "Review"], "stage": 1,
+         "points": ["users table"]}, {"title": "API"}]}, 1)
+    whole, some, single = (mod.plan_prompt(pn), mod.plan_prompt(pn, "wire up the workers"),
+                           mod.plan_prompt(pn, task=pn["tasks"][0]))
+    check("a plan request says what to plan: the whole note, what was typed, or one task",
+          "Request: plan this whole note.\nThe note:\n<<<\nBuild the base\n>>>\n"
+          "Background: Agreed with Sam.\n" in whole
+          and "Request: plan this piece of work.\n<<<\nwire up the workers\n>>>\n" in some
+          and "Request: plan this existing task.\n<<<\nSchema\n>>>\nIts notes so far:\n<<<\n"
+              "- users table\n>>>\n" in single and whole.startswith("Today is "))
+    check("...and lists the tasks already there, with how far along each is",
+          whole.endswith("Tasks already on the note:\n<<<\n- Schema  [stages Draft > Review; "
+                         "1 of 2 done; has notes]\n- API  [0% done; no notes yet]\n>>>"), whole)
+
+    def strict(s):
+        if s.get("type") == "object":
+            return (s.get("additionalProperties") is False
+                    and sorted(s["required"]) == sorted(s["properties"])
+                    and all(strict(v) for v in s["properties"].values()))
+        return s.get("type") != "array" or strict(s["items"])
+
+    check("every job's answer schema is strict all the way down",
+          all(strict(schema) for _, schema in mod.AI_JOBS.values()))
+    check("notes keep their context files and their text from before a restructure; junk is dropped",
+          mod._normalise({"refs": ["a", "a", " b ", 3, ""], "text_before": {"text": "old"}}, 1)["refs"]
+          == ["a", "b", "3"] and "text_before" not in mod._normalise({"text_before": "junk"}, 1)
+          and mod._normalise({"text_before": {"text": "old"}}, 1)["text_before"] == {"text": "old"})
 
     # ══════════════════════ inside the app ══════════════════════
     print("-- app --")
@@ -597,52 +806,307 @@ try:
     app._dismiss_suggestion(app.suggestions[0]["id"])
     check("dismissing drops it without making a note", app.suggestions == [] and len(app.notes) == 6)
 
-    # 3. the note window + suggest tasks ----------------------------------
+    # 3. the note window: planning tasks -----------------------------------
     for t in list(app.toasts):
         t.destroy()
     app.toasts.clear()
+    told = []                             # message boxes, which would otherwise wait for a click
+    mod.messagebox.showinfo = lambda title, message="", **k: told.append((title, message))
+    mod.messagebox.showwarning = lambda title, message="", **k: told.append((title, message))
+
+    def dialogs(win, title):
+        return [w for w in win.winfo_children()
+                if isinstance(w, tk.Toplevel) and w.title() == title]
+
+    def buttons(win, text):
+        return [x for x in walk(win) if isinstance(x, tk.Button) and x.cget("text") == text]
+
+    def press(win, text):
+        buttons(win, text)[0].invoke()
+        pump(300)
+
+    def click(widget):
+        widget.event_generate("<Button-1>")
+        pump(250)
+
+    def tasks_tab(win):
+        click([x for x in walk(win) if isinstance(x, tk.Label)
+               and str(x.cget("text")).startswith("Tasks")][0])
+
+    def sheet(win):
+        return "\n".join(x.get("1.0", "end-1c") for x in walk(win) if isinstance(x, tk.Text))
+
+    def asked(job):
+        return [p for n, p in Scripted.asked if n == job]
+
+    def suggest(win):
+        """Press Suggest and wait for the proposals."""
+        Scripted.asked.clear()
+        click(labels(win, "✨ Suggest")[0])
+        pump(4000, lambda: dialogs(win, "Suggested tasks"))
+        return (dialogs(win, "Suggested tasks") or [None])[0]
+
     app.open_note(note["id"])
     pump(400)
-    editor = [w for w in app.root.winfo_children() if isinstance(w, tk.Toplevel) and w.title() == "Note"][0]
+    editor = app._editors[note["id"]]
     editor.geometry("+150+10")
     check("the note shows what was actually said, and the background",
           labels(editor, "“" + ask_msg["text"] + "”") and labels(editor, note["context"]))
-    tab = [x for x in walk(editor) if isinstance(x, tk.Label) and str(x.cget("text")).startswith("Tasks")][0]
-    tab.event_generate("<Button-1>")
-    pump(300)
-    button = labels(editor, "✨ Suggest")
-    check("Suggest button present in the Tasks tab", len(button) == 1)
+    tasks_tab(editor)
+    check("Suggest button present in the Tasks tab", len(labels(editor, "✨ Suggest")) == 1)
     shot(editor, "32_note_from_suggestion")
-    Scripted.answers["breakdown"] = {"tasks": [
-        {"title": "Pull the Q3 numbers", "stages": []},                 # already there
-        {"title": "Check figures with finance", "stages": []},
-        {"title": "Get sign-off", "stages": ["Draft", "Review", "Approved"]},
-        {"title": "", "stages": []}, "junk"]}
-    Scripted.asked.clear()
-    button[0].event_generate("<Button-1>")
-    picker = lambda: [w for w in editor.winfo_children()
-                      if isinstance(w, tk.Toplevel) and w.title() == "Suggested tasks"]
-    check("proposals shown for review", pump(4000, lambda: picker()))
-    bd = [p for n, p in Scripted.asked if n == "breakdown"][0]
-    check("the model is given the note, its background and the existing tasks",
-          "Board report from the Q3 numbers" in bd and "Background: Sam needs" in bd
-          and "- Pull the Q3 numbers\n- Draft the report" in bd)
-    dlg = picker()[0]
+    Scripted.answers["plan"] = {"tasks": [
+        {"title": "Pull the Q3 numbers", "stages": [], "points": [], "priority": "normal"},  # there already
+        {"title": "Check figures with finance", "stages": [],
+         "points": ["Send finance the draft table", "• Agree the rounding"], "priority": "high"},
+        {"title": "Get sign-off", "stages": ["Draft", "Review", "Approved"], "points": [],
+         "priority": "normal"},
+        {"title": "check FIGURES with finance", "stages": [], "points": [], "priority": "low"},
+        {"title": "", "stages": [], "points": [], "priority": "normal"}, "junk"],
+        "comment": "Assumed the report goes out as a PDF."}
+    dlg = suggest(editor)
+    check("proposals shown for review", dlg is not None)
+    bd = asked("plan")[0]
+    check("with the box empty the whole note is planned: the model gets the note, its "
+          "background and the tasks so far",
+          "Request: plan this whole note." in bd and "Board report from the Q3 numbers" in bd
+          and "Background: Sam needs" in bd
+          and "- Pull the Q3 numbers  [0% done; no notes yet]\n"
+              "- Draft the report  [0% done; no notes yet]" in bd, bd)
     dlg.attributes("-topmost", True)
     shot(dlg, "33_suggested_tasks")
     boxes = [x for x in walk(dlg) if isinstance(x, tk.Checkbutton)]
-    check("duplicates and junk filtered out before you see them", len(boxes) == 2, str(len(boxes)))
-    [x for x in walk(dlg) if isinstance(x, tk.Button) and x.cget("text") == "Add tasks"][0].invoke()
-    pump(300)
+    check("repeats and junk are filtered out before you see them", len(boxes) == 2, str(len(boxes)))
+    check("each proposal shows its plan, and the assistant's own remark is passed on",
+          "Check figures with finance    High\n•  Send finance the draft table\n"
+          "•  Agree the rounding" in sheet(dlg) and "Draft  →  Review  →  Approved" in sheet(dlg)
+          and labels(dlg, "“Assumed the report goes out as a PDF.”"), sheet(dlg))
+    press(dlg, "Add tasks")
     titles = [t["title"] for t in note["tasks"]]
     check("chosen tasks added",
           titles == ["Pull the Q3 numbers", "Draft the report", "Check figures with finance", "Get sign-off"],
           str(titles))
-    check("a task that came with stages is tracked through them",
-          note["tasks"][3]["mode"] == "stages" and note["tasks"][3]["stages"] == ["Draft", "Review", "Approved"]
-          and note["tasks"][2]["mode"] == "percent" and len({t["id"] for t in note["tasks"]}) == 4)
+    check("...in full: with their steps and priority, and tracked through stages where they have them",
+          note["tasks"][2]["points"] == ["Send finance the draft table", "Agree the rounding"]
+          and note["tasks"][2]["priority"] == 2 and note["tasks"][2]["mode"] == "percent"
+          and note["tasks"][3]["mode"] == "stages"
+          and note["tasks"][3]["stages"] == ["Draft", "Review", "Approved"]
+          and len({t["id"] for t in note["tasks"]}) == 4)
     editor.destroy()
     pump(300)
+
+    # 3b. what is typed, tasks that exist already, one task, and context files
+    # (The engine paces itself to a dozen requests a minute. These steps make
+    # more than that in a few seconds, so the count is cleared between them.)
+    app.ai.recent.clear()
+    trip = app.get_note(5)
+    gone = os.path.join(OUT, "gone.txt")
+    trip["tasks"] = [mod._normalise_task({"id": 1, "title": "Book the venue"}, 1),
+                     mod._normalise_task({"id": 2, "title": "Send invitations", "collapsed": True}, 2)]
+    trip["refs"] = [proj, gone]
+    app.open_note(5)
+    pump(400)
+    ed = app._editors[5]
+    ed.geometry("+120+10")
+    tasks_tab(ed)
+    box = labels(ed, mod.TaskPanel.ADD_HINT_AI)[0].master      # the "add a task" field
+    Scripted.answers["plan"] = {"tasks": [
+        {"title": "book the VENUE", "stages": ["Shortlist", "Visit", "Sign"],
+         "points": ["Room for 40", "Near the station"], "priority": "urgent"},
+        {"title": "Arrange transport", "stages": [], "points": ["Coach from the office"],
+         "priority": "normal"}], "comment": ""}
+    dlg = suggest(ed)
+    whole = asked("plan")[0]
+    check("files named in the note's Context are read and sent along, fenced off as material",
+          "BEGIN REFERENCE-" in whole and "A booking service." in whole and "hunter2" not in whole
+          and whole.index("Tasks already on the note") < whole.index("BEGIN REFERENCE-"))
+    check("...and the answer comes with what was read and what was not",
+          [x for x in walk(dlg) if isinstance(x, tk.Label)
+           and str(x.cget("text")).startswith("Read for context: 1 folder, 6 files")
+           and "gone.txt (not found)" in x.cget("text")])
+    check("a task returned under a title you already have fills that task in, not a second one",
+          "Book the venue    fills in the task you have\nShortlist  →  Visit  →  Sign\n"
+          "•  Room for 40" in sheet(dlg), sheet(dlg))
+    dlg.attributes("-topmost", True)
+    shot(dlg, "37_plan_fills_in")
+    press(dlg, "Apply")
+    venue = trip["tasks"][0]
+    check("filling in sets stages and steps, keeps the task's own title and priority; new tasks are added",
+          [t["title"] for t in trip["tasks"]] == ["Book the venue", "Send invitations", "Arrange transport"]
+          and venue["mode"] == "stages" and venue["stages"] == ["Shortlist", "Visit", "Sign"]
+          and venue["points"] == ["Room for 40", "Near the station"] and venue["priority"] == 1
+          and trip["tasks"][2]["points"] == ["Coach from the office"], str(trip["tasks"]))
+
+    box.insert(0, "send invitations to everyone, with the agenda, two weeks ahead")
+    typed = box.get()
+    Scripted.answers["plan"] = {"tasks": [                     # the title comes back reworded
+        {"title": "Send the invitations.", "stages": ["Draft", "Send", "Chase"],
+         "points": ["Attach the agenda", "Send two weeks ahead"], "priority": "high"}], "comment": ""}
+    dlg = suggest(ed)
+    check("what is typed in the box is what gets planned",
+          f"Request: plan this piece of work.\n<<<\n{typed}\n>>>" in asked("plan")[0])
+    press(dlg, "Apply")
+    invite = trip["tasks"][1]
+    check("...and when that is a task you already have, it is planned in full instead of duplicated",
+          len(trip["tasks"]) == 3 and invite["mode"] == "stages"
+          and invite["stages"] == ["Draft", "Send", "Chase"]
+          and invite["points"] == ["Attach the agenda", "Send two weeks ahead"]
+          and invite["collapsed"] is False, str(invite))
+    check("the box is cleared once its text has become a plan", box.get() == "")
+
+    box.insert(0, "order name badges")
+    Scripted.answers["plan"] = {"tasks": [
+        {"title": "Order name badges", "stages": [],
+         "points": ["40 badges", "Names from the invitation list"], "priority": "low"}],
+        "comment": "Assumed one badge per invitee."}
+    press(suggest(ed), "Add tasks")
+    badges = trip["tasks"][-1]
+    check("something new that is typed becomes a new task, planned",
+          len(trip["tasks"]) == 4 and badges["title"] == "Order name badges"
+          and badges["points"] == ["40 badges", "Names from the invitation list"]
+          and badges["priority"] == 0 and box.get() == "", str(badges))
+
+    told.clear()
+    Scripted.answers["plan"] = {"tasks": [], "comment": "Everything in this note is already planned."}
+    click(labels(ed, "✨ Suggest")[0])
+    check("when there is nothing to add, the assistant's reason is shown, with what it read",
+          pump(4000, lambda: told) and told[0][0] == "Suggest tasks" and told[0][1].startswith(
+              "Everything in this note is already planned.\n\nRead for context:"), str(told))
+
+    hold = threading.Event()              # a model that takes its time
+    Scripted.answers["plan"] = lambda p: (hold.wait(8), {"tasks": [], "comment": "Nothing more."})[1]
+    told.clear()
+    click(labels(ed, "✨ Suggest")[0])
+    check("while the assistant works, the button counts the seconds",
+          pump(5000, lambda: labels(ed, "Thinking… 2s") or labels(ed, "Thinking… 3s")))
+    hold.set()
+    check("...and is itself again once the answer is in",
+          pump(4000, lambda: told and labels(ed, "✨ Suggest")) and told[0][1].startswith("Nothing more."))
+
+    venue["stage"] = 1                    # this task is now under way
+    check("an open task has its own Plan button", len(labels(ed, "✨ Plan")) == 2)
+    Scripted.answers["plan"] = {"tasks": [
+        {"title": "Reserve the hall", "stages": ["A", "B"],
+         "points": ["Near the station", "Ask about catering"], "priority": "low"}], "comment": ""}
+    Scripted.asked.clear()
+    click(labels(ed, "✨ Plan")[0])
+    pump(4000, lambda: dialogs(ed, "Suggested tasks"))
+    dlg = dialogs(ed, "Suggested tasks")[0]
+    check("Plan on a task asks about that task, and passes on the notes it has",
+          "Request: plan this existing task.\n<<<\nBook the venue\n>>>\nIts notes so far:\n<<<\n"
+          "- Room for 40\n- Near the station\n>>>" in asked("plan")[0], asked("plan")[0])
+    check("only what is new is offered, and a task that is under way keeps its stages",
+          "Book the venue    fills in the task you have\n•  Ask about catering" in sheet(dlg)
+          and "A  →  B" not in sheet(dlg) and "Near the station" not in sheet(dlg), sheet(dlg))
+    press(dlg, "Apply")
+    check("...so its progress is not disturbed",
+          venue["stages"] == ["Shortlist", "Visit", "Sign"] and venue["stage"] == 1
+          and venue["points"] == ["Room for 40", "Near the station", "Ask about catering"]
+          and venue["title"] == "Book the venue", str(venue))
+
+    context = [w for w in walk(ed) if hasattr(w, "context")][0].context
+    check("the Context row names what the assistant may read",
+          "Orbit" in context["summary"].cget("text") and "gone.txt" in context["summary"].cget("text"),
+          context["summary"].cget("text"))
+    context["remove"](gone)
+    saved_refs = lambda: [n for n in json.load(open(mod.DATA_FILE, encoding="utf-8"))
+                          if n["id"] == 5][0]["refs"]
+    check("a file or folder can be added and removed; a wrong path is refused, a repeat ignored",
+          context["add"](os.path.join(OUT, "no-such-folder")) == "That file or folder was not found."
+          and context["add"](proj) == "" and trip["refs"] == [proj]
+          and context["add"](os.path.join(OUT, "brief.pdf")) == ""
+          and trip["refs"] == [proj, os.path.join(OUT, "brief.pdf")] and saved_refs() == trip["refs"],
+          str(trip["refs"]))
+    shot(ed, "38_note_with_context")
+    ed.destroy()
+    pump(300)
+
+    blank = mod._normalise({"id": 99, "text": ""}, 99)
+    app.notes.append(blank)
+    app.open_note(99)
+    pump(400)
+    tasks_tab(app._editors[99])
+    told.clear()
+    Scripted.asked.clear()
+    click(labels(app._editors[99], "✨ Suggest")[0])
+    pump(400)
+    check("with nothing typed and nothing in the note, nothing is sent - the app says what to do",
+          Scripted.asked == [] and len(told) == 1 and "Type what needs doing" in told[0][1], str(told))
+    app._editors[99].destroy()
+    app.notes.remove(blank)
+    pump(300)
+
+    # 3c. the Note tab: structure the note ---------------------------------
+    app.ai.recent.clear()
+    post = app.get_note(2)
+    original = ("launch post. needs intro about the new sync, pricing unchanged $9, quote from "
+                "Dana, publish 3 Dec. also tweet + newsletter")
+    post["text"] = original
+    post["refs"] = [os.path.join(proj, "README.md")]
+    app.open_note(2)
+    pump(400)
+    ep = app._editors[2]
+    ep.geometry("+140+10")
+    strip = labels(ep, "Restore the original")[0].master     # the strip that offers the old text
+    check("the Note tab has a Structure button; Restore waits until there is something to restore",
+          len(buttons(ep, "✨ Structure")) == 1 and not strip.winfo_manager())
+    Scripted.answers["structure"] = {
+        "summary": "Write and publish the launch post on 3 Dec.",
+        "blocks": [{"kind": "heading", "text": "What goes in", "items": []},
+                   {"kind": "bullets", "text": "", "items": [
+                       "Intro about the new sync", "Pricing unchanged at $9", "Quote from Dana"]},
+                   {"kind": "heading", "text": "After publishing", "items": []},
+                   {"kind": "text", "text": "Tweet it and put it in the newsletter.", "items": []}],
+        "tasks": [{"title": "Draft the post", "stages": ["Outline", "Draft", "Edit"],
+                   "points": ["Open with the new sync"], "priority": "normal"}],
+        "comment": ""}
+    Scripted.asked.clear()
+    buttons(ep, "✨ Structure")[0].invoke()
+    check("the structured version is shown for review",
+          pump(4000, lambda: dialogs(ep, "Structured note")))
+    check("the model is given the note and its Context file",
+          f"The note:\n<<<\n{original}\n>>>" in asked("structure")[0]
+          and "=== FILE README.md ===" in asked("structure")[0])
+    dlg = dialogs(ep, "Structured note")[0]
+    expected = ("Write and publish the launch post on 3 Dec.\n\nWhat goes in\n"
+                "• Intro about the new sync\n• Pricing unchanged at $9\n• Quote from Dana\n\n"
+                "After publishing\nTweet it and put it in the newsletter.")
+    check("the preview shows the new text with its headings, and the tasks it would add - "
+          "and nothing has changed yet",
+          any(v.get("1.0", "end-1c") == expected and "f:h2:" in v.tag_names("3.0")
+              for v in walk(dlg) if isinstance(v, tk.Text))
+          and "Draft the post\nOutline  →  Draft  →  Edit" in sheet(dlg)
+          and post["text"] == original and post["tasks"] == [], sheet(dlg))
+    dlg.attributes("-topmost", True)
+    shot(dlg, "39_structured_note")
+    press(dlg, "Apply")
+    check("applying replaces the text, formatting included, and adds the tasks",
+          post["text"] == expected
+          and {("f:body:i", "1.0"), ("f:h2:", "3.0"), ("f:h2:", "8.0")} <= {(t, a) for t, a, _ in post["fmt"]}
+          and [t["title"] for t in post["tasks"]] == ["Draft the post"]
+          and post["tasks"][0]["stages"] == ["Outline", "Draft", "Edit"], str(post["fmt"]))
+    check("the text from before is kept, and Restore is offered under the toolbar",
+          post["text_before"]["text"] == original and strip.winfo_manager() == "pack")
+    shot(ep, "40_note_structured")
+    click(labels(ep, "Restore the original")[0])
+    check("Restore brings the original back, and then steps aside again",
+          post["text"] == original and "text_before" not in post and not strip.winfo_manager()
+          and [n for n in json.load(open(mod.DATA_FILE, encoding="utf-8"))
+               if n["id"] == 2][0]["text"] == original)
+    buttons(ep, "✨ Structure")[0].invoke()
+    pump(4000, lambda: dialogs(ep, "Structured note"))
+    dlg = dialogs(ep, "Structured note")[0]
+    check("asked again, the task it already added is not offered a second time",
+          not [x for x in walk(dlg) if isinstance(x, tk.Checkbutton) and not x.cget("text")])
+    press(dlg, "Apply")
+    click([x for x in strip.winfo_children() if x.cget("text") == "✕"][0])
+    check("dismissing the strip keeps the new version and lets the original go",
+          post["text"] == expected and "text_before" not in post and not strip.winfo_manager()
+          and len(post["tasks"]) == 1)
+    ep.destroy()
+    pump(300)
+    post["text"], post["fmt"] = "Write the launch post", []   # one line again, for the steps below
+    app.ai.recent.clear()
 
     # 4. focus now --------------------------------------------------------
     Scripted.answers["focus"] = {"focus": [
@@ -654,8 +1118,10 @@ try:
     # checked before the event loop runs again, i.e. before any answer can land
     check("popup opens at once with a placeholder", labels(pop, "Working out what matters most…"))
     pop.geometry("+60+40")
+    # (the line break is what tells a focus pick, "title / reason", from the
+    # same note's row in the plain list underneath)
     check("focus picks appear", pump(4000, lambda: any(
-        str(x.cget("text")).startswith("Renew the domain") for x in walk(pop) if isinstance(x, tk.Label))))
+        str(x.cget("text")).startswith("Renew the domain\n") for x in walk(pop) if isinstance(x, tk.Label))))
     rows = [x.cget("text") for x in walk(pop) if isinstance(x, tk.Label) and "\n" in str(x.cget("text"))]
     check("only real notes, no repeats, with reasons",
           rows == ["Renew the domain\nDue in three hours.",
@@ -775,6 +1241,7 @@ try:
           app.config["ai_provider"] == "claude" and app.config["ai_claude_key"] == "sk-ant-secret-123"
           and "sk-ant-secret-123" not in disk and json.loads(disk)["ai_claude_key"].startswith("dpapi:"))
     check("default Claude model kept", app.config["ai_claude_model"] == "claude-opus-5-5")
+    check("the ceiling on context text is saved as a number", app.config["ai_ref_chars"] == 40000)
     check("the engine picks up the new provider without a restart",
           isinstance(app.ai.provider(), mod.ClaudeProvider) and app.ai.provider().api_key == "sk-ant-secret-123")
     app.config["ai_provider"] = ""

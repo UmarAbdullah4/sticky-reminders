@@ -120,6 +120,7 @@ def main():
          "--add-data", f"{icon}{os.pathsep}assets",
          # Loaded by name at run time, where PyInstaller's import scan cannot see them.
          "--collect-submodules", "websockets",
+         "--collect-submodules", "pypdf",
          "--hidden-import", "pystray._win32",
          "--version-file", version_resource(version),
          "--distpath", app_dir, "--workpath", os.path.join(BUILD, "work"), "--specpath", BUILD,

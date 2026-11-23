@@ -20,6 +20,10 @@ and see [Install](#install).
 |---|---|---|
 | ![A note's Tasks tab](docs/screenshots/tasks.png) | ![Suggested notes waiting for a decision](docs/screenshots/suggestions.png) | ![The reminder popup with a focus pick](docs/screenshots/reminder.png) |
 
+| A task planned by the assistant | A note it structured | Files it may read |
+|---|---|---|
+| ![Proposed tasks with stages and steps, and what was read for context](docs/screenshots/plan.png) | ![A note rewritten under headings, with a task proposed](docs/screenshots/structure.png) | ![A note's Context row naming a folder and a file](docs/screenshots/context.png) |
+
 The screenshots show made-up demo data.
 
 ## Features
@@ -55,7 +59,12 @@ The screenshots show made-up demo data.
 - Suggested notes: requests addressed to you are spotted without a trigger word
   and wait for you to accept or dismiss them
 - A line of background from the thread on notes that come from chat
-- Break a note into tasks
+- Plan work: describe a task in a few words and get it back planned in full,
+  with stages, concrete steps and a priority. Or have a whole note planned.
+- Structure a note: a rushed note comes back summarised and tidied under
+  headings and bullets, with tasks proposed if it needs them
+- Give it context: name files or folders on a note, and the assistant reads them
+  when it works on that note
 - A "focus now" pick at the top of the reminder popup
 - A drafted reply when you mark a chat note done, which you review before it is sent
 
@@ -133,6 +142,7 @@ python -m pip install -r requirements.txt
 | `websockets` | Mattermost, Slack and Discord connectors |
 | `pystray` + `pillow` | The system tray icon |
 | `anthropic` | The Claude option of the assistant |
+| `pypdf` | Lets the assistant read PDF files named in a note's Context |
 
 Telegram needs no extra package, and neither do the OpenAI, Gemini and
 open-source options of the assistant.
@@ -266,14 +276,51 @@ What it can do, each with its own switch:
   most right now, and why.
 - **Draft the reply.** Marking a chat note done opens the reply for you to read
   and edit, drafted from the note's tasks. Nothing is posted until you press Send.
-- **Suggest tasks.** Always available once a provider is set: ✨ Suggest in a
-  note's Tasks tab proposes tasks, and you choose which to keep.
+Three more need no switch, because they only run when you press them:
+
+- **✨ Suggest**, in a note's Tasks tab. Type a piece of work into the box, in
+  as few or as many words as you like, and press Suggest: it comes back as a
+  task planned in full, with the stages it passes through, the concrete steps
+  to take and a priority. If what you typed is a task you already have, that
+  task is filled in rather than duplicated. With the box empty, the whole note
+  is planned: tasks without notes are filled in and missing ones are proposed.
+- **✨ Plan**, on an open task. Plans that one task. A task that is already
+  under way keeps its stages, so its progress is not disturbed.
+- **✨ Structure**, in the Note tab. Rewrites the note as a short summary,
+  headings and bullets, and proposes tasks if the note describes work to
+  track. It is told to keep every fact and add nothing. Your text as it was is
+  kept: *Restore the original*, under the toolbar, brings it back.
+
+In all three you see what is proposed first and tick what you want. Nothing
+changes until you press the button.
+
+### Giving it context
+
+A note's **Context** row, under Tags, names files and folders for the assistant
+to read whenever you use ✨ in that note: a project folder, a brief, a spec.
+Add them with **＋ Add**, or copy a path and choose *Add the path on the
+clipboard*.
+
+- **A folder** is sent as an outline of what is in it, followed by the files
+  that say most about it: the readme, the files that define the project
+  (`package.json`, `pyproject.toml` and the like), documentation, then source
+  files, shallowest first.
+- **A file** is sent as text. Text, code and Word documents work as they are;
+  PDF files need the `pypdf` package (included in the installed version).
+- **There is a ceiling** on how much is read per request: 40,000 characters,
+  which you can change in Settings → AI.
+- **Credentials stay behind.** Files that exist to hold them (`.env`, keys,
+  `credentials.json` and so on) are never read, and values that look like keys
+  or passwords are blanked out of everything else.
+- **You are told what was read.** Each answer comes with a line saying how
+  many files and characters were sent, and what was left out and why.
 
 ### What is sent, and what it costs
 
 - The text the model works on (the note or message involved, and for context
-  the surrounding thread) goes to the provider you chose. Use a model running
-  on your own PC and it stays there.
+  the surrounding thread) goes to the provider you chose. So does what is read
+  from the files and folders in a note's Context, each time you use ✨ in that
+  note. Use a model running on your own PC and it all stays there.
 - Keys are sent in headers, never in a URL, and are stored encrypted.
 - Text from chat is treated as untrusted: it is fenced off in the prompt and the
   model is told it is material, not instructions. Nothing a model returns takes

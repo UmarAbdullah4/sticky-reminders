@@ -9,6 +9,37 @@ new features, **patch** for fixes.
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-11-23
+
+### Added
+- ✨ Suggest now plans what you type. Describe a piece of work in the "add a
+  task" box and it comes back as a task planned in full: stages, concrete steps
+  and a priority. If it is a task you already have, that task is filled in
+  instead of being added twice.
+- ✨ Plan on an open task plans that one task. A task that is under way keeps
+  its stages.
+- ✨ Structure in the Note tab: the note summarised and tidied under headings
+  and bullets, with tasks proposed if it needs them. The text as it was is
+  kept, and "Restore the original" brings it back.
+- Context: a note can name files and folders for the assistant to read when it
+  works on that note. Folders are sent as an outline plus the files that say
+  most; Word documents are read as they are, PDF files with the `pypdf`
+  package. Files that hold credentials are never read, values that look like
+  credentials are blanked out, there is a ceiling on how much is sent, and each
+  answer says what was read.
+
+### Changed
+- With the box empty, ✨ Suggest plans the whole note: tasks without notes are
+  filled in and missing ones proposed, each with its steps.
+- When the assistant has nothing to add, it now says why.
+- While the assistant works on something you asked for, its button counts the
+  seconds. Such requests no longer queue behind background ones, and a model
+  that takes too long is reported as that rather than as "could not be reached".
+
+### Fixed
+- ✨ Suggest ignored what was typed in the "add a task" box and only looked at
+  the note, so it often answered "nothing to add".
+
 ## [2.4.1] - 2026-11-23
 
 ### Fixed
@@ -159,7 +190,8 @@ The first version, "Sticky Notes Reminder".
   confirmation back to the channel.
 - Start with Windows.
 
-[Unreleased]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.4.1...HEAD
+[Unreleased]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.5.0...HEAD
+[2.5.0]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.4.1...v2.5.0
 [2.4.1]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.3.1...v2.4.0
 [2.3.1]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.3.0...v2.3.1
