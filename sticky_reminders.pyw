@@ -1,7 +1,17 @@
 """
-Sticky Reminders  -  v2.1
+Sticky Reminders  -  v2.2
 =========================
-A desktop sticky-notes + reminder app with Mattermost integration.
+A desktop sticky-notes + reminder app. Messages from Mattermost, Slack,
+Discord and Telegram can become notes, and marking a note done replies in
+the thread it came from.
+
+What changed in v2.2:
+  * Connectors: Slack, Discord and Telegram alongside Mattermost
+  * Tokens and passwords are encrypted on disk (Windows DPAPI)
+  * TLS certificates are verified (was switched off)
+  * Daily backups, recovery from a damaged notes file, import from JSON
+  * Repeating due dates
+  * One window per note, and a round of crash / data-loss fixes
 
 What changed in v2.1:
   * Tasks inside every note (the "Tasks" tab of an open note)
@@ -20,33 +30,48 @@ What changed in v2:
   * Atomic saves with backup, rotating log file
 
 Requirements:  python -m pip install websockets pystray pillow
-Config:        config.json (same folder)
+               (Windows only; the tray icon and the websocket connectors are
+               optional - the app runs without either package)
+Config:        config.json (same folder; secrets inside it are encrypted)
 Data:          ~/.sticky_reminders.json
+Backups:       ~/.sticky_reminders_backups/  (one per day, newest 14 kept)
 Log:           ~/.sticky_reminders.log
 """
 
 import asyncio
+import base64
+import calendar
+import ctypes
+import html
 import json
 import logging
 import os
+import random
+import re
 import shutil
 import socket
 import ssl
 import subprocess
 import sys
 import threading
+import time
 import winsound
+from collections import deque
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from queue import Queue, Empty
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 APP_NAME = "Sticky Reminders"
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
+# Sent to the chat services as part of the User-Agent. Point it at the
+# project's repository once it has one.
+APP_HOMEPAGE = "https://github.com/"
 
 # ─── Paths ───
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +79,8 @@ CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 HOME = os.path.expanduser("~")
 DATA_FILE = os.path.join(HOME, ".sticky_reminders.json")
 LOG_FILE = os.path.join(HOME, ".sticky_reminders.log")
+BACKUP_DIR = os.path.join(HOME, ".sticky_reminders_backups")
+BACKUP_KEEP = 14
 STARTUP_DIR = os.path.join(HOME, "AppData", "Roaming", "Microsoft", "Windows",
                            "Start Menu", "Programs", "Startup")
 SHORTCUT_PATH = os.path.join(STARTUP_DIR, "StickyReminders.lnk")
@@ -101,7 +128,6 @@ COLORS = [
     {"name": "Orange", "bg": "#FFE5C2", "header": "#F5A524", "text": "#1A1A1A"},
 ]
 DONE_COLOR = {"bg": "#2C3038", "header": "#4A505C", "text": "#7E8695"}
-MM_COLOR = 3
 
 # (label, colour, short badge)
 PRIORITIES = [
@@ -121,12 +147,33 @@ MUTE_CHOICES = [("30 minutes", 30), ("1 hour", 60), ("2 hours", 120),
 DEFAULT_STAGES = ["Plan", "Do", "Review", "Done"]
 MAX_STAGES = 12
 
+# (stored value, label) - how a note's due date repeats once it is done
+REPEATS = [("", "Never"), ("daily", "Daily"), ("weekdays", "Weekdays"),
+           ("weekly", "Weekly"), ("monthly", "Monthly")]
+
+# Config values that are credentials. They are encrypted before they are
+# written to config.json and decrypted when it is read.
+SECRET_KEYS = ("password", "access_token", "slack_app_token", "slack_bot_token",
+               "discord_bot_token", "telegram_bot_token")
+
 DEFAULT_CONFIG = {
     "mattermost_url": "",
     "username": "",
     "password": "",
     "access_token": "",
     "mattermost_enabled": True,
+    "mattermost_verify_tls": True,   # turn off only for a self-signed server you trust
+    "slack_enabled": False,
+    "slack_app_token": "",
+    "slack_bot_token": "",
+    "slack_user_id": "",
+    "discord_enabled": False,
+    "discord_bot_token": "",
+    "discord_user_id": "",
+    "telegram_enabled": False,
+    "telegram_bot_token": "",
+    "telegram_user_id": "",
+    "reply_on_done": True,           # post "Done" back in the thread a note came from
     "trigger_word": "@reminder",
     "reminder_interval_minutes": 60,
     "reminders_enabled": True,
@@ -150,21 +197,101 @@ DEFAULT_CONFIG = {
 #  Persistence
 # ═══════════════════════════════════════════════════════
 
+# Set when something went wrong that the user should hear about; the app
+# shows each one once and clears it.
+_load_problem = None        # notes had to be recovered at startup
+_save_problem = None        # the last save of the notes failed
+_plaintext_secrets = False  # config.json still held unencrypted credentials
+
+_SECRET_PREFIX = "dpapi:"
+
+
+def _dpapi(data, encrypt):
+    """Windows DPAPI: encrypts for the logged-in Windows user, so the result
+    is useless to another account or on another machine."""
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, out = BLOB(len(data), buf), BLOB()
+    crypt = ctypes.windll.crypt32
+    fn = crypt.CryptProtectData if encrypt else crypt.CryptUnprotectData
+    if not fn(ctypes.byref(src), None, None, None, None, 0, ctypes.byref(out)):
+        raise OSError("DPAPI call failed")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        free = ctypes.windll.kernel32.LocalFree
+        free.argtypes = [ctypes.c_void_p]
+        free(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+
+def protect(secret):
+    """Encrypt a credential for storage. Falls back to plain text only if
+    the platform cannot encrypt, so a save never loses the value."""
+    if not secret or secret.startswith(_SECRET_PREFIX):
+        return secret
+    try:
+        blob = _dpapi(secret.encode("utf-8"), True)
+        return _SECRET_PREFIX + base64.b64encode(blob).decode("ascii")
+    except Exception as e:
+        log.error("Could not encrypt a credential, storing it as-is: %s", e)
+        return secret
+
+
+def unprotect(stored):
+    if not isinstance(stored, str) or not stored.startswith(_SECRET_PREFIX):
+        return stored if isinstance(stored, str) else ""
+    try:
+        blob = base64.b64decode(stored[len(_SECRET_PREFIX):])
+        return _dpapi(blob, False).decode("utf-8")
+    except Exception as e:
+        # e.g. config.json copied from another PC or Windows account
+        log.error("A saved credential could not be decrypted - enter it again: %s", e)
+        return ""
+
+
+def _set_aside(path):
+    """Keep a damaged file under a new name instead of letting the next save
+    overwrite it. Returns the new path ('' if even that failed)."""
+    try:
+        keep = f"{path}.corrupt-{datetime.now():%Y%m%d-%H%M%S}"
+        shutil.copy2(path, keep)
+        return keep
+    except Exception:
+        return ""
+
+
 def load_config():
+    global _plaintext_secrets
     cfg = dict(DEFAULT_CONFIG)
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg.update(json.load(f))
+            stored = json.load(f)
+        if not isinstance(stored, dict):
+            raise ValueError("config.json is not a JSON object")
+        cfg.update(stored)
     except FileNotFoundError:
         pass
     except Exception as e:
-        log.error("Config load failed: %s", e)
+        log.error("Config load failed, using defaults: %s", e)
+        _set_aside(CONFIG_FILE)
+    _plaintext_secrets = any(
+        isinstance(cfg.get(k), str) and cfg[k] and not cfg[k].startswith(_SECRET_PREFIX)
+        for k in SECRET_KEYS)
+    for k in SECRET_KEYS:
+        cfg[k] = unprotect(cfg.get(k, ""))
     return cfg
 
 
 def save_config(cfg):
     try:
-        _atomic_write(CONFIG_FILE, json.dumps(cfg, indent=4))
+        out = dict(cfg)
+        for k in SECRET_KEYS:
+            out[k] = protect(out.get(k, "") or "")
+        _atomic_write(CONFIG_FILE, json.dumps(out, indent=4))
     except Exception as e:
         log.error("Config save failed: %s", e)
 
@@ -180,7 +307,16 @@ def _atomic_write(path, text):
             shutil.copy2(path, path + ".bak")
         except Exception:
             pass
-    os.replace(tmp, path)
+    # A virus scanner, the search indexer or a sync client can hold the file
+    # open for a moment; Windows then refuses the swap. Give it a few tries.
+    for attempt in range(6):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _normalise_task(t, fallback_id):
@@ -232,6 +368,8 @@ def _normalise(n, fallback_id):
     n.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
     n.setdefault("done_at", "")
     n.setdefault("pinned", False)
+    if n.get("repeat") not in dict(REPEATS):     # v2.2: repeating due dates
+        n["repeat"] = ""
     # v2.1: tasks
     raw = n.get("tasks")
     tasks = [_normalise_task(t, i + 1)
@@ -246,28 +384,91 @@ def _normalise(n, fallback_id):
     return n
 
 
+def _read_notes(path):
+    """Parse a notes file (the live one, a backup or an export). Raises if it
+    is not one; repairs what can be repaired."""
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if isinstance(raw, dict) and isinstance(raw.get("notes"), list):
+        raw = raw["notes"]
+    if not isinstance(raw, list):
+        raise ValueError("not a list of notes")
+    notes = [_normalise(n, i + 1) for i, n in enumerate(raw) if isinstance(n, dict)]
+    seen = set()
+    for n in notes:                       # ids must be unique integers
+        if type(n["id"]) is not int or n["id"] in seen:
+            n["id"] = max(seen, default=0) + 1
+        seen.add(n["id"])
+    return notes
+
+
+def _backup_files():
+    """Daily backups, newest first."""
+    try:
+        names = sorted((f for f in os.listdir(BACKUP_DIR)
+                        if f.startswith("notes-") and f.endswith(".json")), reverse=True)
+    except OSError:
+        names = []
+    return [os.path.join(BACKUP_DIR, f) for f in names]
+
+
+def daily_backup():
+    """Keep one dated copy of the notes per day, newest BACKUP_KEEP of them.
+    The per-save .bak is only ever one keystroke old; this is the copy that
+    survives a mistake you notice the next morning."""
+    try:
+        if not os.path.exists(DATA_FILE):
+            return
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        today = os.path.join(BACKUP_DIR, f"notes-{datetime.now():%Y-%m-%d}.json")
+        if not os.path.exists(today):
+            _read_notes(DATA_FILE)        # never file a damaged copy as a backup
+            shutil.copy2(DATA_FILE, today)
+        for old in _backup_files()[BACKUP_KEEP:]:
+            os.remove(old)
+    except Exception as e:
+        log.error("Daily backup failed: %s", e)
+
+
 def load_notes():
-    if os.path.exists(DATA_FILE):
+    """Load the notes. If the file is damaged it is set aside (never
+    overwritten) and the most recent readable backup is used instead."""
+    global _load_problem
+    _load_problem = None
+    if not os.path.exists(DATA_FILE):
+        return []
+    try:
+        return _read_notes(DATA_FILE)
+    except Exception as e:
+        log.error("Notes file unreadable: %s", e)
+    kept = _set_aside(DATA_FILE) or "(could not be copied)"
+    for candidate in [DATA_FILE + ".bak"] + _backup_files():
         try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                notes = json.load(f)
-            return [_normalise(n, i + 1) for i, n in enumerate(notes)]
-        except Exception as e:
-            log.error("Notes load failed, trying backup: %s", e)
-            try:
-                with open(DATA_FILE + ".bak", "r", encoding="utf-8") as f:
-                    notes = json.load(f)
-                return [_normalise(n, i + 1) for i, n in enumerate(notes)]
-            except Exception:
-                log.error("Backup unusable, starting empty")
+            notes = _read_notes(candidate)
+        except Exception:
+            continue
+        log.error("Recovered notes from %s", candidate)
+        _load_problem = (f"The notes file could not be read, so your notes were restored "
+                         f"from the backup {os.path.basename(candidate)}.\n\n"
+                         f"The damaged file was kept as:\n{kept}")
+        return notes
+    log.error("No readable backup, starting empty")
+    _load_problem = (f"The notes file could not be read and no backup could be loaded, "
+                     f"so the app has started empty.\n\n"
+                     f"The damaged file was kept as:\n{kept}")
     return []
 
 
 def save_notes(notes):
+    global _save_problem
     try:
         _atomic_write(DATA_FILE, json.dumps(notes, indent=2))
+        _save_problem = None
+        return True
     except Exception as e:
         log.error("Notes save failed: %s", e)
+        _save_problem = str(e)
+        return False
 
 
 # ═══════════════════════════════════════════════════════
@@ -440,6 +641,79 @@ def work_area(x, y):
     return None
 
 
+def on_some_monitor(x, y, w, h):
+    """True if that rectangle is at least partly on a connected monitor.
+    A window position saved while a second screen was plugged in would
+    otherwise reopen where nobody can see it."""
+    try:
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        u.MonitorFromRect.restype = wintypes.HANDLE
+        u.MonitorFromRect.argtypes = [ctypes.POINTER(wintypes.RECT), wintypes.DWORD]
+        rect = wintypes.RECT(int(x), int(y), int(x + w), int(y + h))
+        return bool(u.MonitorFromRect(ctypes.byref(rect), 0))    # 0 = none if off-screen
+    except Exception:
+        return True
+
+
+def usable_geometry(geometry, default="980x680"):
+    """A saved 'WxH+X+Y' if its title bar is still reachable, else `default`."""
+    m = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", geometry or "")
+    if not m:
+        return default
+    w, h, x, y = (int(v) for v in m.groups())
+    if w < 300 or h < 200 or not on_some_monitor(x + 40, y, max(1, w - 80), 40):
+        return default
+    return geometry
+
+
+def tls_context(verify=True):
+    """TLS settings for a connector. Verification is on unless the user has
+    explicitly switched it off for a self-signed server."""
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def next_occurrence(due, repeat, now=None):
+    """The next time after `now` on a repeat schedule that started at `due`
+    (or at `now` when the note has no due date). None if it does not repeat."""
+    now = now or datetime.now()
+    when = due or now
+    anchor_day = when.day
+    for _ in range(4000):                 # bounded even for a note years overdue
+        if repeat == "daily":
+            when += timedelta(days=1)
+        elif repeat == "weekdays":
+            when += timedelta(days=1)
+            while when.weekday() >= 5:
+                when += timedelta(days=1)
+        elif repeat == "weekly":
+            when += timedelta(days=7)
+        elif repeat == "monthly":
+            year, month = when.year + when.month // 12, when.month % 12 + 1
+            last = calendar.monthrange(year, month)[1]
+            when = when.replace(year=year, month=month, day=min(anchor_day, last))
+        else:
+            return None
+        if when > now:
+            return when
+    return when
+
+
+def is_chat(n):
+    """Did this note arrive through a connector rather than being typed here?"""
+    return (n.get("source") or "local") != "local"
+
+
+def source_label(n):
+    """'Slack', 'Mattermost'... for a note that came from a connector."""
+    cls = CONNECTOR_BY_KEY.get(n.get("source"))
+    return cls.label if cls else str(n.get("source") or "Chat").title()
+
+
 def run_hidden(args):
     """Run a command with no console flash."""
     si = subprocess.STARTUPINFO()
@@ -482,13 +756,47 @@ def set_startup(enable):
 
 
 class SingleInstance:
-    """Bind a loopback port. Second launch just tells the first one to show."""
+    """One copy per login session.
+
+    A named mutex decides who is first. That is the authority: a loopback
+    port alone cannot tell "another copy of this app" from "some other
+    program is using that port", and would then refuse to start at all.
+    The port is only the doorbell a second launch rings to make the first
+    copy show itself, and it answers only to this app's own greeting.
+    """
+
+    MUTEX = "Local\\StickyReminders.SingleInstance"
+    HELLO = b"sticky-reminders:show\n"
+    ALREADY_EXISTS = 183
 
     def __init__(self, on_show):
         self.on_show = on_show
         self.sock = None
+        self._mutex = None
 
     def acquire(self):
+        """True if this is the first copy (and it should carry on starting)."""
+        first = None
+        try:
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.CreateMutexW.restype = ctypes.c_void_p
+            k.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+            ctypes.set_last_error(0)
+            self._mutex = k.CreateMutexW(None, 0, self.MUTEX)   # held until exit
+            if self._mutex:
+                first = ctypes.get_last_error() != self.ALREADY_EXISTS
+        except Exception as e:
+            log.warning("Mutex unavailable, falling back to the port: %s", e)
+        listening = self._listen()
+        if first is None:               # no mutex: the port is all there is
+            return listening
+        if first and not listening:
+            log.warning("Port %s is in use by another program; a second launch "
+                        "will not be able to bring this window forward.",
+                        SINGLE_INSTANCE_PORT)
+        return first
+
+    def _listen(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             s.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
@@ -504,17 +812,28 @@ class SingleInstance:
         while True:
             try:
                 conn, _ = self.sock.accept()
-                conn.close()
-                self.on_show()
             except Exception:
                 return
-
-    @staticmethod
-    def signal_existing():
-        try:
-            with socket.create_connection(("127.0.0.1", SINGLE_INSTANCE_PORT), timeout=2):
+            try:
+                conn.settimeout(1.0)
+                if conn.recv(64) == self.HELLO:     # ignore port scanners and strays
+                    conn.sendall(b"ok\n")
+                    self.on_show()
+            except Exception:
                 pass
-            return True
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    @classmethod
+    def signal_existing(cls):
+        try:
+            with socket.create_connection(("127.0.0.1", SINGLE_INSTANCE_PORT),
+                                          timeout=2) as c:
+                c.sendall(cls.HELLO)
+                return c.recv(16) == b"ok\n"
         except Exception:
             return False
 
@@ -1614,121 +1933,173 @@ class TaskPanel:
 
 
 # ═══════════════════════════════════════════════════════
-#  Mattermost
+#  Connectors
 # ═══════════════════════════════════════════════════════
+#
+# A connector watches one chat service and turns messages into notes. The
+# rule is the same everywhere: a message containing the trigger word becomes
+# a note when you wrote it, when it mentions you, or when it was sent to you
+# directly. Marking the note done can post a reply in the thread it came from.
+#
+# Each connector runs on its own thread and reaches the app only through the
+# message queue, so nothing in this section touches Tk:
+#
+#   {"type": "status",   "source": key, "conn": self, "text": ..., "ok": ...}
+#   {"type": "reminder", "source": key, "text": ..., "sender": ..., ...}
+#
+# To add a service: subclass Connector (SocketConnector for websocket APIs),
+# describe its settings in FIELDS / HELP, and list it in CONNECTORS below.
+# The settings page, status bar and menus are all built from that list.
 
-class MattermostClient:
-    def __init__(self, config, message_queue):
-        self.url = config.get("mattermost_url", "").rstrip("/")
-        self.username = config.get("username", "")
-        self.password = config.get("password", "")
-        self.token_cfg = config.get("access_token", "")
-        self.trigger = config.get("trigger_word", "@reminder")
-        self.queue = message_queue
-        self.token = None
-        self.user_id = None
-        self.my_username = None
+class ConnectorError(Exception):
+    """Something the user has to fix (bad token, missing permission). The
+    connector reports it and stops, instead of retrying a doomed sign-in."""
+
+
+def http_json(url, payload=None, headers=None, timeout=15, context=None,
+              form=False, want_headers=False):
+    """POST `payload` (GET when it is None) and return the decoded JSON reply.
+    HTTP error statuses raise urllib's HTTPError, body still readable."""
+    hdrs = {"User-Agent": f"StickyReminders/{APP_VERSION}", "Accept": "application/json"}
+    data = None
+    if payload is not None:
+        if form:
+            data = urlencode(payload).encode("utf-8")
+            hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            data = json.dumps(payload).encode("utf-8")
+            hdrs["Content-Type"] = "application/json; charset=utf-8"
+    hdrs.update(headers or {})
+    with urlopen(Request(url, data=data, headers=hdrs), timeout=timeout,
+                 context=context) as resp:
+        body = resp.read().decode("utf-8", "replace")
+        parsed = json.loads(body) if body.strip() else {}
+        return (parsed, resp.headers) if want_headers else parsed
+
+
+def http_error_body(err):
+    """The JSON body of an HTTPError, or {} if it has none."""
+    try:
+        parsed = json.loads(err.read().decode("utf-8", "replace"))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def certificate_problem(err):
+    """Is this exception a TLS certificate that failed verification?"""
+    reason = getattr(err, "reason", err)
+    return isinstance(reason, ssl.SSLCertVerificationError)
+
+
+class Connector:
+    key = ""             # stored on notes as `source`
+    label = ""           # name shown in the UI
+    color = 3            # colour index given to notes from this service
+    enabled_key = ""     # config flag that switches it on
+    FIELDS = ()          # (config key, label, "text" | "secret" | "check")
+    HELP = ""            # setup steps shown on the settings page
+
+    def __init__(self, config, queue):
+        self.queue = queue
+        self.trigger = (config.get("trigger_word") or "").strip() or "@reminder"
+        self.running = False
+        self.thread = None
+        self.tls = tls_context()
+
+    # ── what a subclass provides ──
+    @classmethod
+    def configured(cls, config):
+        """Are the credentials this connector needs filled in?"""
+        raise NotImplementedError
+
+    @classmethod
+    def test(cls, config):
+        """Check the credentials once. Returns a line for the user; raises
+        on failure."""
+        raise NotImplementedError
+
+    def run(self):
+        """Listen until self.running goes False. Runs on the connector thread."""
+        raise NotImplementedError
+
+    def reply(self, note, text):
+        """Post `text` in the thread `note` came from. True on success."""
+        raise NotImplementedError
+
+    def who(self):
+        """How this account is named in a 'completed by' reply."""
+        return "me"
+
+    # ── lifecycle ──
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._guarded, daemon=True,
+                                       name=f"connector-{self.key}")
+        self.thread.start()
+
+    def stop(self):
         self.running = False
 
-        self.ssl_ctx = ssl.create_default_context()
-        self.ssl_ctx.check_hostname = False
-        self.ssl_ctx.verify_mode = ssl.CERT_NONE
-
-    # ── auth ──
-    def login(self):
-        if self.token_cfg:
-            self.token = self.token_cfg
-            try:
-                req = Request(f"{self.url}/api/v4/users/me",
-                              headers={"Authorization": f"Bearer {self.token}"})
-                data = json.loads(urlopen(req, context=self.ssl_ctx, timeout=15).read())
-                self.user_id = data.get("id")
-                self.my_username = data.get("username", "")
-                self._status(f"Signed in as @{self.my_username}", True)
-                return True
-            except Exception as e:
-                self._status(f"Token rejected: {e}", False)
-                return False
-
-        if not (self.url and self.username and self.password):
-            self._status("Not configured", False)
-            return False
-
+    def _guarded(self):
         try:
-            payload = json.dumps({"login_id": self.username,
-                                  "password": self.password}).encode("utf-8")
-            req = Request(f"{self.url}/api/v4/users/login", data=payload,
-                          headers={"Content-Type": "application/json"})
-            try:
-                resp = urlopen(req, context=self.ssl_ctx, timeout=15)
-            except HTTPError as e:
-                body = e.read().decode("utf-8", "replace")
-                try:
-                    err = json.loads(body)
-                    msg = err.get("message", body[:200])
-                    if "too_many" in err.get("id", ""):
-                        msg += " (reset login attempts in System Console)"
-                except Exception:
-                    msg = body[:200]
-                self._status(f"Login failed: {msg}", False)
-                return False
-
-            self.token = resp.headers.get("Token")
-            data = json.loads(resp.read().decode("utf-8"))
-            self.user_id = data.get("id")
-            self.my_username = data.get("username", "")
-            log.info("Mattermost login OK as @%s", self.my_username)
-            self._status(f"Signed in as @{self.my_username}", True)
-            return True
+            self.run()
+        except ConnectorError as e:
+            log.error("%s: %s", self.label, e)
+            self.status(str(e), False)
         except Exception as e:
-            self._status(f"Connection error: {e}", False)
-            return False
+            log.exception("%s connector stopped unexpectedly", self.label)
+            self.status(f"Stopped: {e}", False)
+        finally:
+            self.running = False
 
-    def _status(self, text, ok):
-        self.queue.put({"type": "status", "text": text, "ok": ok})
+    # ── talking to the app ──
+    def status(self, text, ok):
+        if self.running:              # a stopped connector must not overwrite its successor
+            self.queue.put({"type": "status", "source": self.key, "conn": self,
+                            "text": text, "ok": ok})
 
-    # ── posting ──
-    def send_message(self, channel_id, message, root_id=None):
-        try:
-            payload = {"channel_id": channel_id, "message": message}
-            if root_id:
-                payload["root_id"] = root_id
-            req = Request(f"{self.url}/api/v4/posts",
-                          data=json.dumps(payload).encode("utf-8"),
-                          headers={"Content-Type": "application/json",
-                                   "Authorization": f"Bearer {self.token}"})
-            urlopen(req, context=self.ssl_ctx, timeout=10)
-            return True
-        except Exception as e:
-            log.error("Send failed: %s", e)
-            return False
+    def emit(self, raw, text, sender, channel, channel_id, post_id, is_self,
+             thread_id=""):
+        """Hand a message to the app as a new note. `raw` is the untouched
+        message (priority markers are read from it), `text` the cleaned one."""
+        if not self.running or not text:
+            return
+        self.queue.put({
+            "type": "reminder", "source": self.key, "text": text,
+            "priority": self.priority_from(raw),
+            "sender": sender or "Unknown", "channel": channel or "Unknown",
+            "channel_id": str(channel_id or ""), "post_id": str(post_id or ""),
+            "thread_id": str(thread_id or ""), "is_self": bool(is_self),
+            "timestamp": datetime.now().strftime("%I:%M %p"),
+        })
 
-    # ── matching ──
-    def _should_create_note(self, message, sender_id):
-        low = message.lower()
-        if self.trigger.lower() not in low:
-            return False
-        if sender_id == self.user_id:
-            return True
-        if self.my_username and f"@{self.my_username.lower()}" in low:
-            return True
-        return False
+    # ── shared message handling ──
+    def wants(self, text):
+        return self.trigger.lower() in (text or "").lower()
 
-    def _extract(self, message):
-        text = message
-        i = text.lower().find(self.trigger.lower())
-        if i != -1:
-            text = text[:i] + text[i + len(self.trigger):]
-        if self.my_username:
-            at = f"@{self.my_username}"
-            j = text.lower().find(at.lower())
-            if j != -1:
-                text = text[:j] + text[j + len(at):]
-        return text.strip()
+    def clean(self, text, *mentions):
+        """The message without the trigger word and without the given mention
+        tokens (yours, the bot's) - what is left is the note."""
+        text = re.sub(re.escape(self.trigger), "", text or "", flags=re.IGNORECASE)
+        for m in mentions:
+            if m:
+                text = re.sub(re.escape(m) + r"(?![\w-]|\.\w)", "", text,
+                              flags=re.IGNORECASE)
+        return re.sub(r"[ \t]{2,}", " ", text).strip()
 
     @staticmethod
-    def _priority_from(message):
-        low = message.lower()
+    def mentions(text, tag):
+        """Does `text` mention `tag` (e.g. '@sam') as a whole name, not as the
+        start of a longer one ('@samantha', '@sam.lee')?"""
+        return bool(tag) and bool(re.search(re.escape(tag) + r"(?![\w-]|\.\w)",
+                                            text or "", re.IGNORECASE))
+
+    @staticmethod
+    def priority_from(message):
+        low = (message or "").lower()
         if "!urgent" in low or "#urgent" in low:
             return 3
         if "!high" in low or "#high" in low:
@@ -1737,80 +2108,825 @@ class MattermostClient:
             return 0
         return 1
 
-    # ── websocket ──
-    async def _listen(self):
-        import websockets
-        scheme = "wss" if self.url.startswith("https") else "ws"
-        host = self.url.replace("https://", "").replace("http://", "")
-        ws_url = f"{scheme}://{host}/api/v4/websocket"
+    def done_text(self, note, bold="**"):
+        text = note.get("text", "")
+        if note.get("is_self"):
+            return f"✅ {bold}Done:{bold} {text}"
+        return f"✅ {bold}Done{bold} (completed by {self.who()}): {text}"
+
+
+class SocketConnector(Connector):
+    """Shared reconnect loop for the websocket-based services. A subclass
+    implements `session()`: connect, listen until the socket closes."""
+
+    def __init__(self, config, queue):
+        super().__init__(config, queue)
+        self.loop = None
+        self.ws = None
+
+    def run(self):
+        try:
+            import websockets  # noqa: F401
+        except ImportError:
+            raise ConnectorError("Needs the 'websockets' package:  "
+                                 "python -m pip install websockets")
+        self.loop = asyncio.new_event_loop()
+        try:
+            self.loop.run_until_complete(self._forever())
+        finally:
+            self.loop.close()
+
+    async def _forever(self):
         delay = 3
-
         while self.running:
+            started = time.monotonic()
+            planned = False
             try:
-                async with websockets.connect(ws_url, ssl=self.ssl_ctx) as ws:
-                    await ws.send(json.dumps({"seq": 1,
-                                              "action": "authentication_challenge",
-                                              "data": {"token": self.token}}))
-                    await ws.recv()
-                    self._status(f"Connected as @{self.my_username}", True)
-                    delay = 3
-
-                    async for raw in ws:
-                        if not self.running:
-                            break
-                        try:
-                            ev = json.loads(raw)
-                            if ev.get("event") != "posted":
-                                continue
-                            d = ev.get("data", {})
-                            post = json.loads(d.get("post", "{}"))
-                            message = post.get("message", "")
-                            sender_id = post.get("user_id", "")
-                            if not self._should_create_note(message, sender_id):
-                                continue
-                            text = self._extract(message)
-                            if not text:
-                                continue
-                            self.queue.put({
-                                "type": "reminder",
-                                "text": text,
-                                "priority": self._priority_from(message),
-                                "sender": (d.get("sender_name", "") or "Unknown").lstrip("@"),
-                                "channel": d.get("channel_display_name") or d.get("channel_name") or "Unknown",
-                                "channel_id": post.get("channel_id", ""),
-                                "post_id": post.get("id", ""),
-                                "is_self": sender_id == self.user_id,
-                                "timestamp": datetime.now().strftime("%I:%M %p"),
-                            })
-                        except json.JSONDecodeError:
-                            pass
-                        except Exception as e:
-                            log.error("WS event error: %s", e)
+                await self.session()
+                planned = True
+            except ConnectorError:
+                raise
             except Exception as e:
-                if not self.running:
-                    return
-                self._status(f"Disconnected - retrying in {delay}s", False)
-                log.warning("WS error: %s", e)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 60)
+                if certificate_problem(e):
+                    raise ConnectorError(
+                        "The server's TLS certificate could not be verified")
+                log.warning("%s: %s: %s", self.label, type(e).__name__, e)
+            finally:
+                self.ws = None
+            if not self.running:
+                return
+            lasted = time.monotonic() - started
+            if lasted > 60:
+                delay = 3                 # it was up for a while: restart the back-off
+            if planned and lasted > 5:
+                continue                  # the service recycled the connection: just reconnect
+            self.status(f"Disconnected - retrying in {delay}s", False)
+            await self._nap(delay)
+            delay = min(delay * 2, 60)
 
-    def start(self):
-        if not self.token and not self.login():
-            return
-        self.running = True
+    async def _nap(self, seconds):
+        end = time.monotonic() + seconds
+        while self.running and time.monotonic() < end:
+            await asyncio.sleep(0.25)
 
-        def runner():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self._listen())
-            except Exception as e:
-                log.error("WS loop died: %s", e)
+    async def session(self):
+        raise NotImplementedError
 
-        threading.Thread(target=runner, daemon=True).start()
+    def open(self, url, **kw):
+        """`async with self.open(url) as ws:` - TLS is added for wss:// only
+        (the library rejects a TLS context on a plain ws:// address)."""
+        import websockets
+        if url.lower().startswith("wss://"):
+            kw.setdefault("ssl", self.tls)
+        return websockets.connect(url, **kw)
+
+    async def call(self, fn, *args):
+        """Run a blocking HTTP call without stalling the socket's keep-alives."""
+        return await self.loop.run_in_executor(None, fn, *args)
 
     def stop(self):
         self.running = False
+        loop, ws = self.loop, self.ws
+        if loop is not None and ws is not None:
+            try:                          # wake the reader so the thread ends now
+                loop.call_soon_threadsafe(lambda: asyncio.ensure_future(ws.close()))
+            except RuntimeError:
+                pass                      # loop already closed
+
+
+# ─── Mattermost ───
+
+class MattermostConnector(SocketConnector):
+    key = "mattermost"
+    label = "Mattermost"
+    color = 3
+    enabled_key = "mattermost_enabled"
+    FIELDS = (
+        ("mattermost_url", "Server URL", "text"),
+        ("username", "Username / email", "text"),
+        ("password", "Password", "secret"),
+        ("access_token", "Personal access token (preferred - leave blank to use "
+                         "the password)", "secret"),
+        ("mattermost_verify_tls", "Verify the server's TLS certificate", "check"),
+    )
+    HELP = ("You sign in as yourself. A personal access token is safer than your "
+            "password: create one under Profile → Security → Personal Access "
+            "Tokens (an admin may have to enable them) and revoke it any time "
+            "without changing your login.\n\n"
+            "A message containing the trigger word becomes a note when you sent "
+            "it or it mentions you.")
+
+    def __init__(self, config, queue):
+        super().__init__(config, queue)
+        self.url = (config.get("mattermost_url") or "").strip().rstrip("/")
+        self.username = (config.get("username") or "").strip()
+        self.password = config.get("password") or ""
+        self.token_cfg = (config.get("access_token") or "").strip()
+        self.tls = tls_context(config.get("mattermost_verify_tls", True))
+        self.token = None
+        self.user_id = None
+        self.my_username = ""
+        self._refused = 0
+
+    @classmethod
+    def configured(cls, config):
+        return bool((config.get("mattermost_url") or "").strip() and
+                    (config.get("access_token") or
+                     (config.get("username") and config.get("password"))))
+
+    @classmethod
+    def test(cls, config):
+        c = cls(config, Queue())
+        c.login()
+        return f"Signed in as @{c.my_username}"
+
+    def who(self):
+        return f"@{self.my_username}" if self.my_username else "me"
+
+    def _api(self, path, payload=None, auth=True, want_headers=False):
+        headers = {"Authorization": f"Bearer {self.token}"} if auth else {}
+        return http_json(f"{self.url}/api/v4{path}", payload, headers,
+                         context=self.tls, want_headers=want_headers)
+
+    def login(self):
+        """Sign in. ConnectorError means the user has to change something;
+        any other exception is worth retrying."""
+        if not self.url.lower().startswith(("http://", "https://")):
+            raise ConnectorError("The server URL must start with https://")
+        try:
+            if self.token_cfg:
+                self.token = self.token_cfg
+                me = self._api("/users/me")
+            else:
+                me, headers = self._api(
+                    "/users/login",
+                    {"login_id": self.username, "password": self.password},
+                    auth=False, want_headers=True)
+                self.token = headers.get("Token")
+        except HTTPError as e:
+            self.token = None
+            body = http_error_body(e)
+            msg = body.get("message") or f"HTTP {e.code}"
+            if "too_many" in (body.get("id") or ""):
+                msg += " (reset login attempts in the System Console)"
+            if e.code in (400, 401, 403):
+                raise ConnectorError(
+                    ("Token rejected: " if self.token_cfg else "Login failed: ") + msg)
+            raise RuntimeError(msg)
+        except Exception as e:
+            self.token = None
+            if certificate_problem(e):
+                raise ConnectorError(
+                    "The server's TLS certificate could not be verified. If it is "
+                    "self-signed and you trust it, untick 'Verify the server's TLS "
+                    "certificate'.")
+            raise
+        self.user_id = me.get("id")
+        self.my_username = me.get("username", "")
+        if not self.token or not self.user_id:
+            self.token = None
+            raise ConnectorError("Login failed: the server did not return a session")
+
+    async def session(self):
+        if not self.token:
+            await self.call(self.login)
+            log.info("Mattermost login OK as @%s", self.my_username)
+        scheme = "wss" if self.url.lower().startswith("https") else "ws"
+        ws_url = f"{scheme}://{self.url.split('://', 1)[1]}/api/v4/websocket"
+        opened = authed = False
+        try:
+            async with self.open(ws_url) as ws:
+                self.ws = ws
+                opened = True
+                await ws.send(json.dumps({"seq": 1, "action": "authentication_challenge",
+                                          "data": {"token": self.token}}))
+                async for raw in ws:
+                    if not self.running:
+                        break
+                    try:
+                        ev = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if ev.get("seq_reply") == 1 and ev.get("status") == "FAIL":
+                        break
+                    if not authed and (ev.get("status") == "OK" or
+                                       ev.get("event") == "hello"):
+                        authed = True
+                        self._refused = 0
+                        self.status(f"Connected as @{self.my_username}", True)
+                    if ev.get("event") == "posted":
+                        try:
+                            self._on_post(ev.get("data") or {})
+                        except Exception as e:
+                            log.error("Mattermost event error: %s", e)
+        finally:
+            if opened and not authed and self.running:
+                # The server took the connection but not the session: it has
+                # expired or been revoked.
+                self._refused += 1
+                if not self.token_cfg:
+                    self.token = None             # sign in afresh next time round
+                elif self._refused >= 3:
+                    raise ConnectorError("The server keeps refusing the access "
+                                         "token - create a new one")
+
+    def _on_post(self, d):
+        post = json.loads(d.get("post") or "{}")
+        message = post.get("message", "")
+        if not self.wants(message):
+            return
+        from_me = post.get("user_id", "") == self.user_id
+        me_tag = f"@{self.my_username}" if self.my_username else ""
+        if not (from_me or self.mentions(message, me_tag)):
+            return
+        self.emit(raw=message, text=self.clean(message, me_tag),
+                  sender=(d.get("sender_name") or "Unknown").lstrip("@"),
+                  channel=d.get("channel_display_name") or d.get("channel_name"),
+                  channel_id=post.get("channel_id", ""), post_id=post.get("id", ""),
+                  # a reply must name the thread's root, not the post inside it
+                  thread_id=post.get("root_id") or post.get("id", ""),
+                  is_self=from_me)
+
+    def reply(self, note, text):
+        try:
+            self._api("/posts", {"channel_id": note["channel_id"], "message": text,
+                                 "root_id": note.get("thread_id") or note.get("post_id") or ""})
+            return True
+        except Exception as e:
+            log.error("Mattermost reply failed: %s", e)
+            return False
+
+
+# ─── Slack ───
+
+class SlackConnector(SocketConnector):
+    """Slack through Socket Mode: the app dials out over a websocket, so no
+    public URL is needed."""
+
+    key = "slack"
+    label = "Slack"
+    color = 1
+    enabled_key = "slack_enabled"
+    API = "https://slack.com/api"
+    FIELDS = (
+        ("slack_app_token", "App-level token (xapp-…)", "secret"),
+        ("slack_bot_token", "Bot token (xoxb-…)", "secret"),
+        ("slack_user_id", "Your member ID (U…) - optional", "text"),
+    )
+    HELP = ("1. Create an app at api.slack.com/apps (From scratch).\n"
+            "2. Socket Mode: switch it on and create an app-level token with the "
+            "connections:write scope. That is the xapp- token.\n"
+            "3. OAuth & Permissions → Bot Token Scopes: app_mentions:read, "
+            "channels:history, groups:history, im:history, mpim:history, "
+            "channels:read, groups:read, users:read, chat:write.\n"
+            "4. Event Subscriptions → Subscribe to bot events: app_mention, "
+            "message.channels, message.groups, message.im, message.mpim.\n"
+            "5. Install the app to your workspace and copy the Bot User OAuth "
+            "Token. That is the xoxb- token.\n"
+            "6. Invite the app into each channel it should watch:  /invite @YourApp\n\n"
+            "Your member ID is in your Slack profile → ⋮ → Copy member ID. With "
+            "it, your own messages and messages that mention you become notes. "
+            "Without it, only messages that mention the app or are sent to it "
+            "directly do.")
+    BAD_TOKEN = ("invalid_auth", "not_authed", "account_inactive", "token_revoked",
+                 "token_expired", "not_allowed_token_type")
+
+    def __init__(self, config, queue):
+        super().__init__(config, queue)
+        self.app_token = (config.get("slack_app_token") or "").strip()
+        self.bot_token = (config.get("slack_bot_token") or "").strip()
+        self.me_id = (config.get("slack_user_id") or "").strip().upper()
+        self.me_ids = {self.me_id} if self.me_id else set()
+        self.team = ""
+        self.auth_name = ""
+        self.users = {}                   # user id -> display name
+        self.channels = {}                # channel id -> name
+        self.seen = deque(maxlen=300)     # (channel, ts) already handled
+
+    @classmethod
+    def configured(cls, config):
+        return bool((config.get("slack_app_token") or "").strip() and
+                    (config.get("slack_bot_token") or "").strip())
+
+    @classmethod
+    def test(cls, config):
+        c = cls(config, Queue())
+        c._identify()
+        c._call("apps.connections.open", token=c.app_token)
+        return f"Connected to {c.team} as {c.auth_name}"
+
+    def _call(self, method, payload=None, token=None):
+        # Form-encoded on purpose: Slack's read methods do not take JSON bodies.
+        try:
+            data = http_json(f"{self.API}/{method}", payload or {},
+                             {"Authorization": f"Bearer {token or self.bot_token}"},
+                             context=self.tls, form=True)
+        except HTTPError as e:
+            raise RuntimeError(f"Slack {method}: HTTP {e.code}")
+        if not data.get("ok"):
+            err = data.get("error") or "unknown_error"
+            if err in self.BAD_TOKEN:
+                which = "app-level" if token else "bot"
+                raise ConnectorError(f"Slack rejected the {which} token ({err})")
+            raise RuntimeError(f"Slack {method}: {err}")
+        return data
+
+    def _identify(self):
+        who = self._call("auth.test")
+        self.team = who.get("team") or "Slack"
+        self.auth_name = who.get("user") or "app"
+        if who.get("user_id"):
+            # Mentioning the app counts as mentioning you. With a user token
+            # this is your own ID, so your messages count as well.
+            self.me_ids.add(who["user_id"])
+            if not who.get("bot_id") and not self.me_id:
+                self.me_id = who["user_id"]
+
+    async def session(self):
+        if not self.team:
+            await self.call(self._identify)
+        opened = await self.call(lambda: self._call("apps.connections.open",
+                                                    token=self.app_token))
+        async with self.open(opened["url"]) as ws:
+            self.ws = ws
+            async for raw in ws:
+                if not self.running:
+                    break
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                kind = msg.get("type")
+                if kind == "hello":
+                    self.status(f"Connected to {self.team}", True)
+                elif kind == "disconnect":
+                    if msg.get("reason") == "link_disabled":
+                        raise ConnectorError("Socket Mode is switched off for this "
+                                             "Slack app")
+                    if msg.get("reason") != "warning":
+                        break             # Slack is recycling the connection
+                elif msg.get("envelope_id"):
+                    # Acknowledge first, whatever it is, or Slack sends it again.
+                    await ws.send(json.dumps({"envelope_id": msg["envelope_id"]}))
+                    if kind == "events_api":
+                        try:
+                            await self._on_event((msg.get("payload") or {}).get("event") or {})
+                        except Exception as e:
+                            log.error("Slack event error: %s", e)
+
+    async def _on_event(self, ev):
+        if ev.get("type") not in ("message", "app_mention"):
+            return
+        if ev.get("subtype") not in (None, "thread_broadcast", "file_share"):
+            return                        # edits, joins, deletions...
+        if ev.get("bot_id"):
+            return                        # never react to an app's own posts
+        user, text = ev.get("user") or "", ev.get("text") or ""
+        channel, ts = ev.get("channel") or "", ev.get("ts") or ""
+        if not (user and channel and ts) or not self.wants(text):
+            return
+        if (channel, ts) in self.seen:
+            return                        # one post arrives as `message` and `app_mention`
+        self.seen.append((channel, ts))
+        from_me = bool(self.me_id) and user == self.me_id
+        direct = ev.get("channel_type") == "im"
+        mentioned = any(f"<@{i}>" in text or f"<@{i}|" in text for i in self.me_ids)
+        if not (from_me or mentioned or direct):
+            return
+        for uid in re.findall(r"<@([A-Z0-9]+)", text)[:5]:
+            if uid not in self.me_ids:    # so the note reads "@Sam", not an ID
+                await self.call(self._user_name, uid)
+        sender = await self.call(self._user_name, user)
+        place = "direct message" if direct else await self.call(self._channel_name, channel)
+        self.emit(raw=text, text=self.clean(self._plain(text)), sender=sender,
+                  channel=place, channel_id=channel, post_id=ts,
+                  thread_id=ev.get("thread_ts") or ts, is_self=from_me)
+
+    def _plain(self, text):
+        """Slack markup -> readable text: <@U1> mentions, <#C1|name> channels,
+        <url|label> links and the three escaped characters."""
+        def user(m):
+            if m.group(1) in self.me_ids:
+                return ""
+            return "@" + (self.users.get(m.group(1)) or m.group(2) or "someone")
+
+        text = re.sub(r"<@([A-Z0-9]+)(?:\|([^>]*))?>", user, text)
+        text = re.sub(r"<#[A-Z0-9]+\|([^>]*)>", r"#\1", text)
+        text = re.sub(r"<!(here|channel|everyone)(?:\|[^>]*)?>", r"@\1", text)
+        text = re.sub(r"<([^|>]+)\|([^>]+)>", r"\2", text)
+        text = re.sub(r"<((?:https?|mailto):[^>]+)>", r"\1", text)
+        return html.unescape(text)
+
+    def _user_name(self, uid):
+        if uid not in self.users:
+            try:
+                u = self._call("users.info", {"user": uid}).get("user") or {}
+                profile = u.get("profile") or {}
+                self.users[uid] = (profile.get("display_name") or u.get("real_name")
+                                   or u.get("name") or uid)
+            except ConnectorError:
+                raise
+            except Exception as e:        # usually a missing users:read scope
+                log.warning("Slack name lookup failed: %s", e)
+                self.users[uid] = uid
+        return self.users[uid]
+
+    def _channel_name(self, cid):
+        if cid not in self.channels:
+            try:
+                c = self._call("conversations.info", {"channel": cid}).get("channel") or {}
+                self.channels[cid] = c.get("name") or cid
+            except ConnectorError:
+                raise
+            except Exception as e:
+                log.warning("Slack channel lookup failed: %s", e)
+                self.channels[cid] = cid
+        return self.channels[cid]
+
+    def done_text(self, note, bold="*"):
+        return super().done_text(note, bold)      # Slack bold is a single asterisk
+
+    def reply(self, note, text):
+        try:
+            self._call("chat.postMessage", {
+                "channel": note["channel_id"], "text": text,
+                "thread_ts": note.get("thread_id") or note.get("post_id") or ""})
+            return True
+        except Exception as e:
+            log.error("Slack reply failed: %s", e)
+            return False
+
+
+# ─── Discord ───
+
+class DiscordConnector(SocketConnector):
+    """Discord through the bot Gateway. (Automating a personal account is
+    against Discord's terms, so this needs a bot.)"""
+
+    key = "discord"
+    label = "Discord"
+    color = 4
+    enabled_key = "discord_enabled"
+    API = "https://discord.com/api/v10"
+    GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json"
+    # guilds | guild messages | direct messages | message content
+    INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15)
+    FIELDS = (
+        ("discord_bot_token", "Bot token", "secret"),
+        ("discord_user_id", "Your user ID - optional", "text"),
+    )
+    HELP = ("1. discord.com/developers/applications → New Application → Bot → "
+            "Reset Token, and copy the token.\n"
+            "2. On the same Bot page, switch on Message Content Intent.\n"
+            "3. OAuth2 → URL Generator: scope 'bot'; permissions View Channels, "
+            "Send Messages and Read Message History. Open the generated link to "
+            "add the bot to your server.\n\n"
+            "Your user ID: User Settings → Advanced → Developer Mode, then "
+            "right-click your name → Copy User ID. With it, your own messages and "
+            "messages that mention you become notes. Without it, only messages "
+            "that mention the bot or are sent to it directly do.")
+
+    def __init__(self, config, queue):
+        super().__init__(config, queue)
+        self.token = (config.get("discord_bot_token") or "").strip()
+        self.me_id = (config.get("discord_user_id") or "").strip()
+        self.me_ids = {self.me_id} if self.me_id else set()
+        self.bot_name = ""
+        self.channels = {}                # channel id -> name
+        self.seq = None
+        self.acked = True
+
+    @classmethod
+    def configured(cls, config):
+        return bool((config.get("discord_bot_token") or "").strip())
+
+    @classmethod
+    def test(cls, config):
+        me = cls(config, Queue())._rest("/users/@me")
+        return f"Bot '{me.get('username', '?')}' is valid"
+
+    def who(self):
+        return self.bot_name or "me"
+
+    def _rest(self, path, payload=None):
+        # Discord blocks requests that lack its documented User-Agent shape.
+        headers = {"Authorization": f"Bot {self.token}",
+                   "User-Agent": f"DiscordBot ({APP_HOMEPAGE}, {APP_VERSION})"}
+        try:
+            return http_json(self.API + path, payload, headers, context=self.tls)
+        except HTTPError as e:
+            if e.code == 401:
+                raise ConnectorError("Discord rejected the bot token")
+            raise RuntimeError(f"Discord HTTP {e.code}: "
+                               f"{http_error_body(e).get('message', '')}")
+
+    async def session(self):
+        from websockets.exceptions import ConnectionClosed
+        beat = None
+        try:
+            # Discord has its own heartbeat, and its payloads can be large.
+            async with self.open(self.GATEWAY, max_size=None, ping_interval=None) as ws:
+                self.ws = ws
+                self.seq = None
+                async for raw in ws:
+                    if not self.running:
+                        break
+                    try:
+                        msg = json.loads(raw)
+                    except ValueError:
+                        continue
+                    op, data = msg.get("op"), msg.get("d")
+                    if msg.get("s") is not None:
+                        self.seq = msg["s"]
+                    if op == 10:                                  # Hello
+                        beat = asyncio.ensure_future(
+                            self._heartbeat(ws, data["heartbeat_interval"] / 1000))
+                        await ws.send(json.dumps({"op": 2, "d": {
+                            "token": self.token, "intents": self.INTENTS,
+                            "properties": {"os": "windows", "browser": "sticky-reminders",
+                                           "device": "sticky-reminders"}}}))
+                    elif op == 1:                                 # heartbeat requested
+                        await ws.send(json.dumps({"op": 1, "d": self.seq}))
+                    elif op == 11:                                # heartbeat acknowledged
+                        self.acked = True
+                    elif op == 7:                                 # please reconnect
+                        return
+                    elif op == 9:                                 # session not valid
+                        raise ConnectionError("Discord invalidated the session")
+                    elif op == 0:
+                        try:
+                            await self._dispatch(msg.get("t"), data or {})
+                        except Exception as e:
+                            log.error("Discord event error: %s", e)
+        except ConnectionClosed as e:
+            code = getattr(getattr(e, "rcvd", None), "code", None)
+            if code == 4004:
+                raise ConnectorError("Discord rejected the bot token")
+            if code in (4013, 4014):
+                raise ConnectorError(
+                    "Switch on 'Message Content Intent' for the bot in the Discord "
+                    "Developer Portal (Bot → Privileged Gateway Intents)")
+            raise
+        finally:
+            if beat is not None:
+                beat.cancel()
+
+    async def _heartbeat(self, ws, interval):
+        try:
+            await asyncio.sleep(interval * random.random())
+            while True:
+                self.acked = False
+                await ws.send(json.dumps({"op": 1, "d": self.seq}))
+                await asyncio.sleep(interval)
+                if not self.acked:        # a dead connection that still looks open
+                    await ws.close(4000, "heartbeat not acknowledged")
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass                          # the reader notices the closed socket
+
+    async def _dispatch(self, kind, d):
+        if kind == "READY":
+            me = d.get("user") or {}
+            self.bot_name = me.get("username") or "bot"
+            if me.get("id"):
+                self.me_ids.add(me["id"])     # mentioning the bot counts as mentioning you
+            self.status(f"Connected as {self.bot_name}", True)
+        elif kind == "GUILD_CREATE":
+            for ch in (d.get("channels") or []) + (d.get("threads") or []):
+                self.channels[ch.get("id")] = ch.get("name") or ""
+        elif kind in ("CHANNEL_CREATE", "CHANNEL_UPDATE", "THREAD_CREATE", "THREAD_UPDATE"):
+            self.channels[d.get("id")] = d.get("name") or ""
+        elif kind == "MESSAGE_CREATE":
+            await self._on_message(d)
+
+    async def _on_message(self, d):
+        author = d.get("author") or {}
+        content = d.get("content") or ""
+        if author.get("bot") or not self.wants(content):
+            return
+        pinged = d.get("mentions") or []
+        from_me = bool(self.me_id) and author.get("id") == self.me_id
+        direct = not d.get("guild_id")
+        if not (from_me or direct or any(m.get("id") in self.me_ids for m in pinged)):
+            return
+        names = {m.get("id"): m.get("global_name") or m.get("username") or "someone"
+                 for m in pinged}
+
+        def user(m):
+            return "" if m.group(1) in self.me_ids else "@" + names.get(m.group(1), "someone")
+
+        cid = d.get("channel_id") or ""
+        place = "direct message" if direct else await self.call(self._channel_name, cid)
+        self.emit(raw=content, text=self.clean(re.sub(r"<@!?(\d+)>", user, content)),
+                  sender=author.get("global_name") or author.get("username"),
+                  channel=place, channel_id=cid, post_id=d.get("id") or "",
+                  is_self=from_me)
+
+    def _channel_name(self, cid):
+        if not self.channels.get(cid):
+            try:
+                self.channels[cid] = self._rest(f"/channels/{cid}").get("name") or cid
+            except ConnectorError:
+                raise
+            except Exception as e:
+                log.warning("Discord channel lookup failed: %s", e)
+                self.channels[cid] = cid
+        return self.channels[cid]
+
+    def reply(self, note, text):
+        try:
+            body = {"content": text[:2000], "allowed_mentions": {"parse": []}}
+            if note.get("post_id"):
+                body["message_reference"] = {"message_id": note["post_id"],
+                                             "fail_if_not_exists": False}
+            self._rest(f"/channels/{note['channel_id']}/messages", body)
+            return True
+        except Exception as e:
+            log.error("Discord reply failed: %s", e)
+            return False
+
+
+# ─── Telegram ───
+
+class _TelegramConflict(Exception):
+    """Another getUpdates call (or a webhook) is using the same bot."""
+
+
+class TelegramConnector(Connector):
+    """Telegram through a bot and long polling - plain HTTPS, no websocket."""
+
+    key = "telegram"
+    label = "Telegram"
+    color = 5
+    enabled_key = "telegram_enabled"
+    API = "https://api.telegram.org"
+    POLL = 25                             # seconds each long poll stays open
+    FIELDS = (
+        ("telegram_bot_token", "Bot token (from @BotFather)", "secret"),
+        ("telegram_user_id", "Your numeric user ID", "text"),
+    )
+    HELP = ("1. In Telegram, message @BotFather, send /newbot and copy the token "
+            "it gives you.\n"
+            "2. Paste the token here and save. Then send your new bot any "
+            "message: it answers with your user ID. Paste that here and save "
+            "again.\n\n"
+            "After that, anything you send the bot becomes a note - a quick way "
+            "to capture one from your phone. The bot ignores everyone else.\n\n"
+            "In a group, add the bot and use the trigger word. So that it can "
+            "see group messages, send /setprivacy to @BotFather and choose "
+            "Disable.")
+
+    def __init__(self, config, queue):
+        super().__init__(config, queue)
+        self.token = (config.get("telegram_bot_token") or "").strip()
+        self.me_id = (config.get("telegram_user_id") or "").strip()
+        self.bot_name = ""
+        self.my_username = ""
+        self.hinted = set()               # chats already told how to pair
+
+    @classmethod
+    def configured(cls, config):
+        return bool((config.get("telegram_bot_token") or "").strip())
+
+    @classmethod
+    def test(cls, config):
+        me = cls(config, Queue())._call("getMe")
+        return f"Bot @{me.get('username', '?')} is valid"
+
+    def who(self):
+        return f"@{self.my_username}" if self.my_username else "me"
+
+    def _call(self, method, payload=None, timeout=15):
+        # The token is part of the URL, so the URL must never reach the log.
+        try:
+            data = http_json(f"{self.API}/bot{self.token}/{method}", payload or {},
+                             timeout=timeout, context=self.tls)
+        except HTTPError as e:
+            body = http_error_body(e)
+            code = body.get("error_code") or e.code
+            what = body.get("description") or f"HTTP {e.code}"
+            if code in (401, 404):
+                raise ConnectorError("Telegram rejected the bot token")
+            if code == 409:
+                raise _TelegramConflict(what)
+            raise RuntimeError(f"Telegram {method}: {what}")
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram {method}: {data.get('description')}")
+        return data.get("result")
+
+    def _announce(self):
+        if self.me_id:
+            self.status(f"Connected as @{self.bot_name}", True)
+        else:
+            self.status(f"Message @{self.bot_name} to get your user ID", None)
+
+    def _nap(self, seconds):
+        end = time.monotonic() + seconds
+        while self.running and time.monotonic() < end:
+            time.sleep(0.25)
+
+    def run(self):
+        delay, offset, conflicts, up = 3, None, 0, False
+        while self.running:
+            try:
+                if not self.bot_name:
+                    self.bot_name = self._call("getMe").get("username") or "bot"
+                if not up:
+                    up = True
+                    self._announce()
+                ask = {"timeout": self.POLL, "allowed_updates": ["message"]}
+                if offset is not None:
+                    ask["offset"] = offset
+                updates = self._call("getUpdates", ask, timeout=self.POLL + 10)
+                if not self.running:
+                    return                # a newer connection owns these updates now
+                delay, conflicts = 3, 0
+                for u in updates or []:
+                    # asking for offset = last id + 1 is what confirms an update
+                    offset = max(offset or 0, int(u.get("update_id", 0)) + 1)
+                    try:
+                        self._on_message(u.get("message") or {})
+                    except ConnectorError:
+                        raise
+                    except Exception as e:
+                        log.error("Telegram message error: %s", e)
+            except ConnectorError:
+                raise
+            except _TelegramConflict:
+                # normal for a few seconds after a reconnect, while the
+                # previous long poll is still winding down
+                conflicts += 1
+                if conflicts >= 5:
+                    raise ConnectorError("Something else is reading this bot's "
+                                         "messages (another copy, or a webhook)")
+                self._nap(3)
+            except Exception as e:
+                if not self.running:
+                    return
+                if certificate_problem(e):
+                    raise ConnectorError("Telegram's TLS certificate could not be verified")
+                log.warning("Telegram: %s: %s", type(e).__name__, e)
+                up = False
+                self.status(f"Disconnected - retrying in {delay}s", False)
+                self._nap(delay)
+                delay = min(delay * 2, 60)
+
+    def _on_message(self, m):
+        text = m.get("text") or m.get("caption") or ""
+        chat, sender = m.get("chat") or {}, m.get("from") or {}
+        if not text or sender.get("is_bot"):
+            return
+        uid = str(sender.get("id") or "")
+        private = chat.get("type") == "private"
+        mine = bool(self.me_id) and uid == self.me_id
+        if mine and sender.get("username"):
+            self.my_username = sender["username"]
+
+        if private and not mine:
+            # Not the owner. Tell them once how to pair - nothing they send
+            # becomes a note.
+            if chat.get("id") not in self.hinted:
+                self.hinted.add(chat.get("id"))
+                self._call("sendMessage", {"chat_id": chat.get("id"), "text": (
+                    "This bot is private.\n\nIf it is yours, paste this user ID into "
+                    "Sticky Reminders → Settings → Connectors → Telegram:\n\n" + uid)})
+            return
+        if private and text.strip().lower().startswith("/start"):
+            self._call("sendMessage", {"chat_id": chat.get("id"), "text":
+                       "Connected. Anything you send me becomes a note."})
+            return
+        if not private:
+            # In a group the trigger word is required, as everywhere else.
+            my_tag = f"@{self.my_username}" if self.my_username else ""
+            if not self.wants(text) or not (mine or self.mentions(text, my_tag)):
+                return
+        body = self.clean(text, f"@{self.bot_name}",
+                          f"@{self.my_username}" if self.my_username else "")
+        name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+        self.emit(raw=text, text=body, sender=name or sender.get("username"),
+                  channel="direct message" if private else chat.get("title"),
+                  channel_id=chat.get("id"), post_id=m.get("message_id"), is_self=mine)
+
+    def done_text(self, note, bold=""):
+        return super().done_text(note, bold)      # sent as plain text
+
+    def reply(self, note, text):
+        try:
+            body = {"chat_id": note["channel_id"], "text": text[:4096]}
+            if str(note.get("post_id") or "").isdigit():
+                body["reply_parameters"] = {"message_id": int(note["post_id"]),
+                                            "allow_sending_without_reply": True}
+            self._call("sendMessage", body)
+            return True
+        except Exception as e:
+            log.error("Telegram reply failed: %s", e)
+            return False
+
+
+CONNECTORS = (MattermostConnector, SlackConnector, DiscordConnector, TelegramConnector)
+CONNECTOR_BY_KEY = {c.key: c for c in CONNECTORS}
 
 
 # ═══════════════════════════════════════════════════════
@@ -1901,22 +3017,39 @@ class StickyNotesApp:
     # ─────────────── setup ───────────────
     def __init__(self):
         self.config = load_config()
+        if _plaintext_secrets:
+            # config.json still held readable credentials: rewrite it encrypted,
+            # and its .bak copy too, so no plain-text copy is left lying around
+            save_config(self.config)
+            try:
+                shutil.copy2(CONFIG_FILE, CONFIG_FILE + ".bak")
+            except Exception:
+                pass
         self.notes = load_notes()
+        daily_backup()
         self.next_id = max((n["id"] for n in self.notes), default=0) + 1
         self.msg_queue = Queue()
         self.ui_queue = Queue()
-        self.mm_client = None
+        self.connectors = {}              # connector key -> the live Connector
+        self.conn_state = {}              # connector key -> (status text, ok)
         self.reminder_popup = None
         self.toasts = []
+        self._editors = {}                # note id -> its open window
         self._undo = None
         self._resize_job = None
         self._cols = 3
         self._quitting = False
+        self._save_warned = False
+        self._overdue = -1                # overdue count last drawn on the cards
+        self._backup_day = datetime.now().date()
 
         self.root = tk.Tk()
+        # Under pythonw there is no console, so an error in a callback would
+        # otherwise vanish without a trace.
+        self.root.report_callback_exception = self._log_ui_error
         self.root.title(f"{APP_NAME}")
         self.root.configure(bg=T.bg)
-        self.root.geometry(self.config.get("window_geometry") or "980x680")
+        self.root.geometry(usable_geometry(self.config.get("window_geometry")))
         self.root.minsize(560, 420)
 
         self.font_h1 = ("Segoe UI Semibold", 13)
@@ -1942,22 +3075,28 @@ class StickyNotesApp:
         self.tray = Tray(self)
         self.tray.start()
 
-        self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.render_notes()
         self.root.after(80, lambda: dark_titlebar(self.root))
         self._tick()
         self._poll_queues()
 
-        if self.config.get("mattermost_enabled", True) and self.config.get("mattermost_url"):
-            self.root.after(1200, self.connect_mattermost)
-        else:
-            self._set_mm_status("Mattermost disabled", None)
+        self._paint_status()
+        self.root.after(1200, self.connect_enabled)
 
         if self.config.get("start_minimized", True) and self.tray.available:
             self.root.after(200, self.hide_window)
 
+        if _load_problem:
+            self.root.after(700, lambda m=_load_problem: (
+                self.show_window(),
+                messagebox.showwarning("Notes recovered", m, parent=self.root)))
+
         log.info("Started v%s (pid %s)", APP_VERSION, os.getpid())
+
+    def _log_ui_error(self, exc, val, tb):
+        log.error("Unhandled error in the UI", exc_info=(exc, val, tb))
 
     def _style_ttk(self):
         s = ttk.Style()
@@ -2007,6 +3146,7 @@ class StickyNotesApp:
         m_file.add_separator()
         m_file.add_command(label="Export to Markdown…", command=lambda: self.export("md"))
         m_file.add_command(label="Export to JSON…", command=lambda: self.export("json"))
+        m_file.add_command(label="Import from JSON…", command=self.import_json)
         m_file.add_separator()
         m_file.add_command(label="Hide to tray", accelerator="Esc", command=self.hide_window)
         m_file.add_command(label="Quit", accelerator="Ctrl+Q", command=self.quit_app)
@@ -2014,7 +3154,7 @@ class StickyNotesApp:
 
         m_view = sub()
         for label, val in [("Active", "active"), ("All", "all"), ("Done", "done"),
-                           ("Overdue", "overdue"), ("From Mattermost", "mm"),
+                           ("Overdue", "overdue"), ("From chat", "chat"),
                            ("Archived", "archived")]:
             m_view.add_radiobutton(label=label, variable=self.filter_var, value=val,
                                    command=self.render_notes, selectcolor=T.accent)
@@ -2040,13 +3180,18 @@ class StickyNotesApp:
         m_rem.add_command(label="Settings…", accelerator="Ctrl+,", command=self.open_settings)
         mb.add_cascade(label="Reminders", menu=m_rem)
 
-        m_mm = sub()
-        m_mm.add_command(label="Reconnect", command=self.connect_mattermost)
-        m_mm.add_command(label="Disconnect", command=self.disconnect_mattermost)
-        mb.add_cascade(label="Mattermost", menu=m_mm)
+        m_con = sub()
+        m_con.add_command(label="Reconnect all", command=self.connect_enabled)
+        m_con.add_command(label="Disconnect all (until reconnect)",
+                          command=self.disconnect_all)
+        m_con.add_separator()
+        m_con.add_command(label="Set up connectors…",
+                          command=lambda: self.open_settings("Connectors"))
+        mb.add_cascade(label="Connectors", menu=m_con)
 
         m_help = sub()
         m_help.add_command(label="Open log file", command=self.open_log)
+        m_help.add_command(label="Open backups folder", command=self.open_backups)
         m_help.add_command(label="About", command=self.about)
         mb.add_cascade(label="Help", menu=m_help)
 
@@ -2177,7 +3322,8 @@ class StickyNotesApp:
         self.chip_frame.pack(side="left")
         self.chips = {}
         for label, val in [("Active", "active"), ("All", "all"), ("Done", "done"),
-                           ("Overdue", "overdue"), ("Mattermost", "mm"), ("Archived", "archived")]:
+                           ("Overdue", "overdue"), ("From chat", "chat"),
+                           ("Archived", "archived")]:
             c = tk.Label(self.chip_frame, text=label, font=self.font_small,
                          bg=T.panel, fg=T.fg_dim, padx=12, pady=5, cursor="hand2")
             c.pack(side="left", padx=(0, 6))
@@ -2219,12 +3365,9 @@ class StickyNotesApp:
         inner = tk.Frame(bar, bg=T.panel)
         inner.pack(fill="x", padx=14, pady=5)
 
-        self.mm_dot = tk.Label(inner, text="●", bg=T.panel, fg=T.fg_faint,
-                               font=self.font_tiny)
-        self.mm_dot.pack(side="left")
-        self.mm_status = tk.Label(inner, text="Mattermost: idle", bg=T.panel,
-                                  fg=T.fg_faint, font=self.font_tiny)
-        self.mm_status.pack(side="left", padx=6)
+        # one indicator per switched-on connector, drawn by _paint_status()
+        self.conn_bar = tk.Frame(inner, bg=T.panel)
+        self.conn_bar.pack(side="left")
 
         self.counter_label = tk.Label(inner, text="", bg=T.panel, fg=T.fg_faint,
                                       font=self.font_tiny)
@@ -2261,27 +3404,36 @@ class StickyNotesApp:
         self.ui_queue.put(fn)
 
     def _poll_queues(self):
-        while True:
-            try:
-                fn = self.ui_queue.get_nowait()
-            except Empty:
-                break
-            try:
-                fn()
-            except Exception as e:
-                log.error("UI task failed: %s", e)
+        try:
+            while True:
+                try:
+                    fn = self.ui_queue.get_nowait()
+                except Empty:
+                    break
+                try:
+                    fn()
+                except Exception:
+                    log.exception("UI task failed")
 
-        while True:
-            try:
-                msg = self.msg_queue.get_nowait()
-            except Empty:
-                break
-            if msg["type"] == "status":
-                self._set_mm_status(msg["text"], msg.get("ok"))
-            elif msg["type"] == "reminder":
-                self.add_mattermost_note(msg)
-
-        self.root.after(300, self._poll_queues)
+            while True:
+                try:
+                    msg = self.msg_queue.get_nowait()
+                except Empty:
+                    break
+                try:
+                    if msg["type"] == "status":
+                        # only the connector currently in charge of that
+                        # service may report on it
+                        if self.connectors.get(msg["source"]) is msg.get("conn"):
+                            self._set_status(msg["source"], msg["text"], msg.get("ok"))
+                    elif msg["type"] == "reminder":
+                        self.add_inbox_note(msg)
+                except Exception:
+                    log.exception("Connector message failed")
+        finally:
+            # Whatever happened above, keep polling: the tray menu and every
+            # connector depend on this loop.
+            self.root.after(300, self._poll_queues)
 
     # ─────────────── window state ───────────────
     def show_window(self):
@@ -2298,11 +3450,20 @@ class StickyNotesApp:
             pass
 
     def hide_window(self):
+        """Get the window out of the way without stopping the app."""
         self._remember_geometry()
         if self.tray.available and self.config.get("close_to_tray", True):
             self.root.withdraw()
         else:
             self.root.iconify()
+
+    def on_close(self):
+        """The window's X button: hide to the tray, or really quit when the
+        user has switched 'close to tray' off."""
+        if self.config.get("close_to_tray", True):
+            self.hide_window()
+        else:
+            self.quit_app()
 
     def quit_app(self):
         if self._quitting:
@@ -2310,8 +3471,8 @@ class StickyNotesApp:
         self._quitting = True
         self._remember_geometry()
         log.info("Shutting down")
-        if self.mm_client:
-            self.mm_client.stop()
+        for c in list(self.connectors.values()):
+            c.stop()
         self.tray.stop()
         try:
             self.root.destroy()
@@ -2323,9 +3484,10 @@ class StickyNotesApp:
         messagebox.showinfo(
             "About",
             f"{APP_NAME} {APP_VERSION}\n\n"
-            f"Notes:  {DATA_FILE}\n"
-            f"Config: {CONFIG_FILE}\n"
-            f"Log:    {LOG_FILE}\n\n"
+            f"Notes:   {DATA_FILE}\n"
+            f"Backups: {BACKUP_DIR}\n"
+            f"Config:  {CONFIG_FILE}\n"
+            f"Log:     {LOG_FILE}\n\n"
             f"Python: {sys.version.split()[0]}\n"
             f"PID:    {os.getpid()}",
             parent=self.root)
@@ -2451,30 +3613,64 @@ class StickyNotesApp:
         return datetime.now() + timedelta(minutes=self._interval())
 
     def _tick(self):
-        """One heartbeat per second: schedule reminders, refresh status bar."""
+        """One heartbeat per second: schedule reminders, refresh status bar.
+
+        Guarded on purpose. The loop reschedules itself, so before this an
+        exception anywhere in it stopped every future reminder - silently,
+        because pythonw has no console to print the error to."""
+        try:
+            self._heartbeat()
+        except Exception:
+            log.exception("Heartbeat failed")
+        finally:
+            self.root.after(1000, self._tick)
+
+    def _heartbeat(self):
         now = datetime.now()
 
-        # periodic reminder
+        # periodic reminder (not when everything pending is snoozed)
         if self.config.get("reminders_enabled", True) and now >= self.next_reminder:
             self.next_reminder = now + timedelta(minutes=self._interval())
-            if self.can_notify() and self.active_count() > 0:
+            if self.can_notify() and self._reminder_notes():
                 self.show_reminder_popup()
 
-        # due-date reminders
-        if self.config.get("due_reminders", True):
-            changed = False
-            for n in self.notes:
-                if n.get("done") or n.get("archived") or n.get("due_notified"):
-                    continue
-                due = parse_dt(n.get("due", ""))
-                if due and now >= due:
+        # Due-date alerts. A note counts as announced only once it really has
+        # been, so one that falls due while muted or in quiet hours is
+        # announced when that ends instead of never.
+        overdue = [n for n in self.notes
+                   if not n.get("done") and not n.get("archived")
+                   and (parse_dt(n.get("due", "")) or datetime.max) <= now]
+        if self.config.get("due_reminders", True) and self.can_notify():
+            fresh = [n for n in overdue if not n.get("due_notified")]
+            if fresh:
+                for n in fresh:
                     n["due_notified"] = True
-                    changed = True
-                    if self.can_notify():
-                        self.show_toast("Due now", note_label(n)[:90], color=T.err)
-            if changed:
                 save_notes(self.notes)
+                if len(fresh) == 1:
+                    self.show_toast("Due now", note_label(fresh[0])[:90], color=T.err)
+                else:                     # one toast, not a wall of them
+                    self.show_toast(f"{len(fresh)} notes are due",
+                                    "  •  ".join(note_label(n)[:34] for n in fresh[:3]),
+                                    color=T.err)
+        if len(overdue) != self._overdue:
+            # keeps the cards' red "overdue" state current, muted or not
+            redraw = self._overdue >= 0
+            self._overdue = len(overdue)
+            if redraw:
                 self.render_notes()
+
+        # a new day has started: take today's backup
+        if now.date() != self._backup_day:
+            self._backup_day = now.date()
+            daily_backup()
+
+        # say so - once - if saving has started to fail
+        if _save_problem and not self._save_warned:
+            self._save_warned = True
+            self.show_toast("Your notes could not be saved",
+                            f"{_save_problem[:70]}  (Help → Open log file)", color=T.err)
+        elif not _save_problem:
+            self._save_warned = False
 
         # status bar
         if self.is_muted() or self.in_quiet_hours():
@@ -2485,8 +3681,6 @@ class StickyNotesApp:
             self.countdown_label.config(
                 text=f"Next reminder in {humanise_delta(self.next_reminder - now)}",
                 fg=T.fg_dim)
-
-        self.root.after(1000, self._tick)
 
     def _beep(self):
         if self.config.get("sound_enabled", True):
@@ -2586,8 +3780,8 @@ class StickyNotesApp:
         if note.get("priority", 1) != 1:
             tk.Label(meta, text=f"{pr[2]} {pr[0]}", font=self.font_tiny,
                      bg=T.panel2, fg=pr[1]).pack(side="left", padx=(0, 8))
-        if note.get("source") == "mattermost":
-            tk.Label(meta, text=f"✉ @{note.get('sender', '?')}", font=self.font_tiny,
+        if is_chat(note):
+            tk.Label(meta, text=f"✉ {note.get('sender', '?')}", font=self.font_tiny,
                      bg=T.panel2, fg=T.fg_faint).pack(side="left", padx=(0, 8))
         if note.get("tasks"):
             t_done, t_all, t_pct = note_progress(note)
@@ -2665,7 +3859,18 @@ class StickyNotesApp:
 
         w, h = 340, 84
         sw, sh = t.winfo_screenwidth(), t.winfo_screenheight()
-        slot = len(self.toasts)
+        # The lowest free slot - counting the toasts on screen put a new one
+        # on top of an older one once anything below it had closed.
+        taken = {getattr(x, "_slot", 0) for x in self.toasts}
+        slot = next(i for i in range(len(taken) + 1) if i not in taken)
+        if self.toasts and sh - 80 - (h + 10) * (slot + 1) < 0:
+            oldest = self.toasts.pop(0)   # the stack would run off the top
+            slot = getattr(oldest, "_slot", 0)
+            try:
+                oldest.destroy()
+            except Exception:
+                pass
+        t._slot = slot
         t.geometry(f"{w}x{h}+{sw - w - 24}+{sh - 80 - (h + 10) * (slot + 1)}")
         self.toasts.append(t)
 
@@ -2721,25 +3926,43 @@ class StickyNotesApp:
 
     def mark_done(self, nid):
         n = self.get_note(nid)
-        if not n:
+        if not n or n.get("done"):
             return
-        n["done"] = True
-        n["done_at"] = datetime.now().isoformat(timespec="seconds")
-
-        if n.get("source") == "mattermost" and n.get("channel_id") and \
-                self.mm_client and self.mm_client.token:
-            who = self.mm_client.my_username or "me"
-            reply = (f"✅ **Done:** {n.get('text','')}" if n.get("is_self")
-                     else f"✅ **Done** (completed by @{who}): {n.get('text','')}")
-            threading.Thread(
-                target=lambda: self.mm_client.send_message(n["channel_id"], reply,
-                                                           root_id=n.get("post_id")),
-                daemon=True).start()
-            self.show_toast("Marked done", f"Replied in #{n.get('channel','')}",
+        now = datetime.now()
+        replied = self._reply_done(n)
+        nxt = next_occurrence(parse_dt(n.get("due", "")), n.get("repeat", ""), now)
+        if nxt:
+            # A repeating note is only done for this round: move it on to its
+            # next date, start its tasks over and let it sleep until then.
+            stamp = nxt.isoformat(timespec="seconds")
+            n["due"] = stamp
+            n["due_notified"] = False
+            n["snooze_until"] = stamp
+            n["last_done_at"] = now.isoformat(timespec="seconds")
+            for t in n.get("tasks") or []:
+                t["percent"], t["stage"], t["done_at"] = 0, 0, ""
+            self.show_toast("Done - it repeats", f"Next due {nxt:%a %d %b, %H:%M}",
                             color=T.ok, sound=False)
+        else:
+            n["done"] = True
+            n["done_at"] = now.isoformat(timespec="seconds")
+            if replied:
+                self.show_toast("Marked done",
+                                f"Replied on {source_label(n)}: {n.get('channel', '')}",
+                                color=T.ok, sound=False)
         save_notes(self.notes)
+        self.close_editor(nid)            # an open editor would now be out of date
         self.render_notes()
         self.tray.refresh()
+
+    def close_editor(self, nid):
+        """Close a note's window, if it has one open."""
+        win = self._editors.pop(nid, None)
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
     def reopen_note(self, nid):
         n = self.get_note(nid)
@@ -2748,6 +3971,7 @@ class StickyNotesApp:
             n["done_at"] = ""
             n["due_notified"] = False
             save_notes(self.notes)
+            self.close_editor(nid)
             self.render_notes()
             self.tray.refresh()
 
@@ -2756,6 +3980,7 @@ class StickyNotesApp:
         if n:
             n["archived"] = True
             save_notes(self.notes)
+            self.close_editor(nid)
             self.render_notes()
             self.show_toast("Archived", "Ctrl+Z to undo.", color=T.info, sound=False)
             self._undo = ("archive", nid)
@@ -2769,11 +3994,12 @@ class StickyNotesApp:
             if not messagebox.askyesno("Delete note",
                                        "Delete this note permanently?\n\n"
                                        "(Archive keeps it and can be undone.)",
-                                       parent=self.root):
+                                       parent=self._editors.get(nid) or self.root):
                 return
         self._undo = ("delete", dict(n))
         self.notes = [x for x in self.notes if x["id"] != nid]
         save_notes(self.notes)
+        self.close_editor(nid)
         self.render_notes()
         self.tray.refresh()
 
@@ -2803,14 +4029,23 @@ class StickyNotesApp:
         self.show_toast("Cleaned up", f"{cnt} completed notes archived.",
                         color=T.info, sound=False)
 
-    def add_mattermost_note(self, msg):
+    def add_inbox_note(self, msg):
+        """A connector delivered a message that should become a note."""
+        src = msg.get("source") or "mattermost"
+        if msg.get("post_id") and any(
+                n.get("source") == src and n.get("post_id") == msg["post_id"]
+                and n.get("channel_id") == msg.get("channel_id") for n in self.notes):
+            return                        # the service sent it twice: keep one note
+        cls = CONNECTOR_BY_KEY.get(src)
+        colour = cls.color if cls else 3
         note = _normalise({
-            "id": self.next_id, "text": msg["text"], "color": MM_COLOR,
-            "source": "mattermost", "priority": msg.get("priority", 1),
+            "id": self.next_id, "text": msg["text"], "color": colour,
+            "source": src, "priority": msg.get("priority", 1),
             "sender": msg.get("sender", "Unknown"),
             "channel": msg.get("channel", "Unknown"),
             "channel_id": msg.get("channel_id", ""),
             "post_id": msg.get("post_id", ""),
+            "thread_id": msg.get("thread_id", ""),
             "is_self": msg.get("is_self", False),
             "received_at": msg.get("timestamp", ""),
         }, self.next_id)
@@ -2825,8 +4060,44 @@ class StickyNotesApp:
             self.show_window()
         if self.can_notify():
             label = "Self-reminder" if msg.get("is_self") else \
-                    f"@{msg['sender']} in #{msg['channel']}"
-            self.show_toast(f"✉  {label}", msg["text"], color=COLORS[MM_COLOR]["header"])
+                    f"{msg.get('sender', 'Someone')} in {msg.get('channel', 'chat')}"
+            self.show_toast(f"✉  {label}", msg["text"], color=COLORS[colour]["header"])
+
+    def import_json(self):
+        """Merge notes from an exported file or a backup into the list.
+        Notes already here are skipped, so importing twice is harmless."""
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Import notes",
+            initialdir=BACKUP_DIR if os.path.isdir(BACKUP_DIR) else None,
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            incoming = _read_notes(path)
+        except Exception as e:
+            messagebox.showerror("Import failed",
+                                 f"That file does not contain notes.\n\n{e}",
+                                 parent=self.root)
+            return
+        have = {(n.get("created_at"), n.get("text")) for n in self.notes}
+        added = 0
+        for n in incoming:
+            if (n.get("created_at"), n.get("text")) in have:
+                continue
+            n["id"] = self.next_id
+            self.next_id += 1
+            n["pinned"] = False
+            self.notes.append(n)
+            added += 1
+        if added:
+            save_notes(self.notes)
+            self.render_notes()
+            self.tray.refresh()
+        skipped = len(incoming) - added
+        self.show_toast("Import finished",
+                        f"{added} note{'' if added == 1 else 's'} added" +
+                        (f"  •  {skipped} already here" if skipped else ""),
+                        color=T.ok, sound=False)
 
     # ═══════════ Rendering ═══════════
 
@@ -2846,7 +4117,7 @@ class StickyNotesApp:
                 return False
             if f == "done" and not n.get("done"):
                 return False
-            if f == "mm" and n.get("source") != "mattermost":
+            if f == "chat" and not is_chat(n):
                 return False
             if f == "overdue":
                 due = parse_dt(n.get("due", ""))
@@ -2933,7 +4204,7 @@ class StickyNotesApp:
     def _render_card(self, note, r, c):
         nid = note["id"]
         is_done = note.get("done", False)
-        is_mm = note.get("source") == "mattermost"
+        from_chat = is_chat(note)
         col = DONE_COLOR if is_done else COLORS[note.get("color", 0) % len(COLORS)]
         pr = PRIORITIES[min(3, max(0, note.get("priority", 1)))]
         due = parse_dt(note.get("due", ""))
@@ -2969,7 +4240,7 @@ class StickyNotesApp:
         if note.get("priority", 1) != 1:
             tk.Label(badges, text=pr[2] or pr[0][0], font=("Segoe UI Semibold", 8),
                      bg=pr[1], fg="#FFFFFF", padx=5).pack(side="left", padx=(0, 4))
-        if is_mm:
+        if from_chat:
             tk.Label(badges, text="✉", font=self.font_tiny,
                      bg=col["bg"], fg=col["text"]).pack(side="left", padx=(0, 4))
         if is_done:
@@ -2999,13 +4270,15 @@ class StickyNotesApp:
             self._card_tasks(card, note, col, click, fill_card=not text)
 
         foot_bits = []
-        if is_mm:
+        if from_chat:
             if note.get("sender"):
                 foot_bits.append(f"@{note['sender']}")
             if note.get("channel"):
                 foot_bits.append(f"#{note['channel']}")
         if due:
             foot_bits.append(("Overdue " if overdue else "Due ") + due.strftime("%d %b %H:%M"))
+        if note.get("repeat"):
+            foot_bits.append("repeats " + dict(REPEATS)[note["repeat"]].lower())
         if note.get("tags"):
             foot_bits.append(" ".join("#" + t for t in note["tags"][:2]))
         if foot_bits:
@@ -3134,7 +4407,15 @@ class StickyNotesApp:
         note = self.get_note(nid)
         if not note:
             return
-        is_mm = note.get("source") == "mattermost"
+        already = self._editors.get(nid)
+        if already is not None and already.winfo_exists():
+            # One window per note. Two editors on the same note each kept their
+            # own copy of the text, and the last keystroke in either one won.
+            already.deiconify()
+            already.lift()
+            already.focus_force()
+            return
+        from_chat = is_chat(note)
         is_done = note.get("done", False)
         # A copy, not the palette entry itself: recolouring mutates `col` in
         # place so every widget and closure below reads the new shade lazily.
@@ -3154,7 +4435,8 @@ class StickyNotesApp:
             y = max(area[1], min(y, area[3] - h - 50))
         p.geometry(f"{w}x{h}+{x}+{y}")
         p.minsize(420, 380)
-        p.bind("<Escape>", lambda e: p.destroy())
+        self._editors[nid] = p
+        p.bind("<Escape>", lambda e: close())      # `close` is defined further down
         p.after(60, lambda: dark_titlebar(p))
         # Deliberately NOT transient to the main window. Tk ties a transient
         # child's visibility to its parent: the note minimised with the list,
@@ -3169,10 +4451,11 @@ class StickyNotesApp:
         hdr.pack(fill="x")
         left = tk.Frame(hdr, bg=col["header"])
         left.pack(side="left", fill="x", expand=True)
-        if is_mm:
+        if from_chat:
             src = ("Self-reminder" if note.get("is_self")
-                   else f"From @{note.get('sender','?')} in #{note.get('channel','?')}")
-            tk.Label(left, text="✉  Mattermost reminder", font=("Segoe UI Semibold", 12),
+                   else f"From {note.get('sender','?')} in {note.get('channel','?')}")
+            tk.Label(left, text=f"✉  {source_label(note)} reminder",
+                     font=("Segoe UI Semibold", 12),
                      bg=col["header"], fg="#1A1A1A").pack(anchor="w")
             tk.Label(left, text=src, font=self.font_small, bg=col["header"],
                      fg="#33302A").pack(anchor="w", pady=(2, 0))
@@ -3247,7 +4530,7 @@ class StickyNotesApp:
                   ).pack(side="left", padx=8)
         self._btn(btns, "Delete", lambda: (self.delete_note(nid), p.destroy()),
                   bg="#5A2222", fg="#FFD5D5").pack(side="left")
-        self._btn(btns, "Close", p.destroy).pack(side="right")
+        self._btn(btns, "Close", lambda: close()).pack(side="right")
 
         # attributes panel
         attr = tk.Frame(p, bg=T.panel, padx=18, pady=8)
@@ -3276,26 +4559,49 @@ class StickyNotesApp:
                          bg=T.panel2, fg=T.fg, relief="flat", bd=0, insertbackground=T.fg)
         due_e.pack(side="left", ipady=4, padx=(0, 6))
 
-        def commit_due(*_):
+        def commit_due(*_, quiet=False):
             s = due_var.get().strip()
-            if not s:
-                note["due"] = ""
-            else:
+            new = ""
+            if s:
                 for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d", "%d/%m/%Y %H:%M", "%d/%m/%Y"):
                     try:
-                        note["due"] = datetime.strptime(s, fmt).isoformat(timespec="seconds")
+                        new = datetime.strptime(s, fmt).isoformat(timespec="seconds")
                         break
                     except ValueError:
                         continue
                 else:
-                    messagebox.showwarning("Due date", "Use  YYYY-MM-DD HH:MM", parent=p)
+                    if not quiet:
+                        messagebox.showwarning("Due date", "Use  YYYY-MM-DD HH:MM", parent=p)
                     return
-            note["due_notified"] = False
-            save_notes(self.notes)
-            self.render_notes()
+            if new != note.get("due", ""):
+                # Only a date that actually changed is announced again - merely
+                # tabbing through this field used to re-arm the "Due now" alert.
+                note["due"] = new
+                note["due_notified"] = False
+                save_notes(self.notes)
+                self.render_notes()
 
         due_e.bind("<FocusOut>", commit_due)
         due_e.bind("<Return>", commit_due)
+
+        tk.Label(row2, text="Repeat", font=self.font_tiny, bg=T.panel,
+                 fg=T.fg_faint).pack(side="left", padx=(8, 6))
+        rep_var = tk.StringVar(value=dict(REPEATS)[note.get("repeat", "")])
+        rep_cb = ttk.Combobox(row2, textvariable=rep_var, width=10, state="readonly",
+                              style="D.TCombobox", font=self.font_small,
+                              values=[label for _, label in REPEATS])
+        rep_cb.pack(side="left")
+        Tooltip(rep_cb, "Marking a repeating note done moves it to its next date")
+
+        def commit_repeat(_=None):
+            key = next((k for k, label in REPEATS if label == rep_var.get()), "")
+            if key != note.get("repeat", ""):
+                note["repeat"] = key
+                save_notes(self.notes)
+                self.render_notes()
+            rep_cb.selection_clear()
+
+        rep_cb.bind("<<ComboboxSelected>>", commit_repeat)
 
         # Quick-set buttons get their own row - on a narrow window they would
         # otherwise push "Clear" off the right edge.
@@ -3330,14 +4636,16 @@ class StickyNotesApp:
         tag_e.pack(side="left", ipady=4, padx=(0, 10))
 
         def commit_tags(*_):
-            note["tags"] = [t.strip().lstrip("#") for t in tag_var.get().split(",") if t.strip()]
-            save_notes(self.notes)
-            self.render_notes()
+            tags = [t.strip().lstrip("#") for t in tag_var.get().split(",") if t.strip()]
+            if tags != note.get("tags"):
+                note["tags"] = tags
+                save_notes(self.notes)
+                self.render_notes()
 
         tag_e.bind("<FocusOut>", commit_tags)
         tag_e.bind("<Return>", commit_tags)
 
-        if not is_mm:
+        if not from_chat:
             tk.Label(row3, text="Colour", font=self.font_tiny, bg=T.panel,
                      fg=T.fg_faint).pack(side="left", padx=(6, 6))
             for i, cc in enumerate(COLORS):
@@ -3447,6 +4755,8 @@ class StickyNotesApp:
         def on_destroy(e):
             if e.widget is not p:
                 return
+            if self._editors.get(nid) is p:
+                del self._editors[nid]
             try:
                 # the task list may still own the wheel; cards may be stale
                 self.root.bind_all("<MouseWheel>", self._main_wheel)
@@ -3457,13 +4767,26 @@ class StickyNotesApp:
         p.bind("<Destroy>", on_destroy, add="+")
 
         def on_change(_=None):
-            note["text"] = txt.get("1.0", "end-1c")
-            note["fmt"] = dump_fmt(txt)
-            save_notes(self.notes)
+            if is_done:
+                return                    # a completed note's text is read-only
+            text, fmt = txt.get("1.0", "end-1c"), dump_fmt(txt)
+            if text != note.get("text") or fmt != note.get("fmt"):
+                note["text"], note["fmt"] = text, fmt
+                save_notes(self.notes)
+
+        def close(_=None):
+            """Every way out of the window comes through here, so whatever is
+            in its fields is kept. Esc and the Close button used to drop a due
+            date or tag that had been typed but not yet confirmed."""
+            if not p.winfo_exists():
+                return
+            on_change()
+            commit_due(quiet=True)
+            commit_tags()
+            p.destroy()
 
         txt.bind("<KeyRelease>", on_change)
-        p.protocol("WM_DELETE_WINDOW", lambda: (on_change(), commit_due(), commit_tags(),
-                                                self.render_notes(), p.destroy()))
+        p.protocol("WM_DELETE_WINDOW", close)
 
         def repaint():
             """Restyle the open note for the current `col`."""
@@ -3669,8 +4992,11 @@ class StickyNotesApp:
                         d = parse_dt(n.get("due", ""))
                         if d:
                             bits.append(f"due {d:%d %b %H:%M}")
-                        if n.get("source") == "mattermost":
-                            bits.append(f"@{n.get('sender','')} #{n.get('channel','')}")
+                        if n.get("repeat"):
+                            bits.append(f"repeats {n['repeat']}")
+                        if is_chat(n):
+                            bits.append(f"{source_label(n)}: {n.get('sender','')} "
+                                        f"in {n.get('channel','')}")
                         if n.get("tags"):
                             bits.append(" ".join("#" + t for t in n["tags"]))
                         suffix = f"  _({' | '.join(bits)})_" if bits else ""
@@ -3700,38 +5026,103 @@ class StickyNotesApp:
 
     # ═══════════ Mattermost control ═══════════
 
-    def _set_mm_status(self, text, ok):
-        colour = T.fg_faint if ok is None else (T.ok if ok else T.err)
-        self.mm_dot.config(fg=colour)
-        self.mm_status.config(text=f"Mattermost: {text}", fg=colour)
+    def _set_status(self, key, text, ok):
+        self.conn_state[key] = (text, ok)
+        self._paint_status()
 
-    def connect_mattermost(self):
-        if self.mm_client:
-            self.mm_client.stop()
-        self.config["mattermost_enabled"] = True
-        self._set_mm_status("connecting…", None)
-        self.mm_client = MattermostClient(self.config, self.msg_queue)
-        self.mm_client.start()
+    def _paint_status(self):
+        """Status bar: one dot per switched-on connector (green connected,
+        red needs attention, grey idle). Hover for the detail."""
+        for w in self.conn_bar.winfo_children():
+            w.destroy()
+        shown = [c for c in CONNECTORS if c.key in self.conn_state]
+        if not shown:
+            items = [("No connectors switched on", T.fg_faint,
+                      "Turn chat messages into notes: Settings → Connectors")]
+        else:
+            items = []
+            for cls in shown:
+                text, ok = self.conn_state[cls.key]
+                colour = T.fg_faint if ok is None else (T.ok if ok else T.err)
+                # room for the whole message when there are only one or two
+                face = f"●  {cls.label}: {text[:48]}" if len(shown) <= 2 else f"●  {cls.label}"
+                items.append((face, colour, f"{cls.label}: {text}"))
+        for face, colour, tip in items:
+            lbl = tk.Label(self.conn_bar, text=face, bg=T.panel, fg=colour,
+                           font=self.font_tiny, cursor="hand2")
+            lbl.pack(side="left", padx=(0, 14))
+            lbl.bind("<Button-1>", lambda e: self.open_settings("Connectors"))
+            Tooltip(lbl, tip)
 
-    def disconnect_mattermost(self):
-        if self.mm_client:
-            self.mm_client.stop()
-            self.mm_client = None
-        self.config["mattermost_enabled"] = False
-        save_config(self.config)
-        self._set_mm_status("disconnected", None)
+    def connect(self, key):
+        """(Re)start one connector from the current settings."""
+        cls = CONNECTOR_BY_KEY[key]
+        old = self.connectors.pop(key, None)
+        if old:
+            old.stop()
+        if not cls.configured(self.config):
+            self._set_status(key, "not set up yet", None)
+            return
+        conn = cls(self.config, self.msg_queue)
+        self.connectors[key] = conn
+        self._set_status(key, "connecting…", None)
+        conn.start()
+
+    def connect_enabled(self):
+        """Bring the running connectors in line with the settings."""
+        for cls in CONNECTORS:
+            if self.config.get(cls.enabled_key):
+                self.connect(cls.key)
+            else:
+                old = self.connectors.pop(cls.key, None)
+                if old:
+                    old.stop()
+                self.conn_state.pop(cls.key, None)
+        self._paint_status()
+
+    def disconnect_all(self):
+        for key in list(self.connectors):
+            self.connectors.pop(key).stop()
+            self._set_status(key, "disconnected", None)
+
+    def _reply_done(self, note):
+        """Tell the thread a note came from that it is done. Returns True if
+        a reply was sent on its way."""
+        conn = self.connectors.get(note.get("source"))
+        if not (conn and note.get("channel_id") and self.config.get("reply_on_done", True)):
+            return False
+        text = conn.done_text(note)
+        threading.Thread(target=lambda: conn.reply(note, text), daemon=True).start()
+        return True
+
+    def open_backups(self):
+        try:
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            os.startfile(BACKUP_DIR)
+        except Exception as e:
+            messagebox.showerror("Backups", str(e), parent=self.root)
 
     # ═══════════ Settings ═══════════
 
-    def open_settings(self):
+    def open_settings(self, tab=None):
+        """Open Settings, optionally on a named tab. There is only ever one
+        Settings window: two of them would each save over the other."""
         self.show_window()
+        current = getattr(self, "_settings", None)
+        if current is not None and current[0].winfo_exists():
+            win, book, pages = current
+            win.lift()
+            win.focus_force()
+            if tab in pages:
+                book.select(pages[tab])
+            return
         w = tk.Toplevel(self.root)
         w.title("Settings")
         w.configure(bg=T.panel)
-        w.geometry("580x560+{}+{}".format(self.root.winfo_x() + 140,
+        w.geometry("600x600+{}+{}".format(self.root.winfo_x() + 140,
                                           self.root.winfo_y() + 40))
         w.resizable(True, True)
-        w.minsize(520, 460)
+        w.minsize(540, 460)
         w.bind("<Escape>", lambda e: w.destroy())
         w.after(60, lambda: dark_titlebar(w))
         w.bind("<Destroy>", lambda e: (self.root.bind_all("<MouseWheel>", self._main_wheel)
@@ -3742,11 +5133,14 @@ class StickyNotesApp:
 
         nb = ttk.Notebook(w)
         nb.pack(fill="both", expand=True, padx=12, pady=12)
+        pages = {}                        # tab name -> its frame
+        self._settings = (w, nb, pages)
 
         def page(name):
             """A scrollable tab - some pages are taller than the dialog."""
             outer = tk.Frame(nb, bg=T.panel)
             nb.add(outer, text=name)
+            pages[name] = outer
             cv = tk.Canvas(outer, bg=T.panel, highlightthickness=0)
             sb = ttk.Scrollbar(outer, orient="vertical", command=cv.yview,
                                style="Vertical.TScrollbar")
@@ -3871,27 +5265,104 @@ class StickyNotesApp:
         tk.Entry(qrow, textvariable=v_qe, width=7, font=self.font_small, bg=T.panel2,
                  fg=T.fg, relief="flat", bd=0, insertbackground=T.fg).pack(side="left", ipady=4)
 
-        # ── Mattermost ──
-        p3 = page("Mattermost")
-        v_mm = check(p3, "Connect to Mattermost", "mattermost_enabled")
-        v_url, _ = entry(p3, "Server URL", self.config.get("mattermost_url", ""))
-        v_user, _ = entry(p3, "Username / email", self.config.get("username", ""))
-        v_pass, pw_entry = entry(p3, "Password", self.config.get("password", ""), show="•")
-        show_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(p3, text="Show password", variable=show_var, font=self.font_tiny,
-                       bg=T.panel, fg=T.fg_faint, selectcolor=T.panel2, bd=0,
-                       highlightthickness=0, activebackground=T.panel, cursor="hand2",
-                       command=lambda: pw_entry.config(show="" if show_var.get() else "•")
-                       ).pack(anchor="w", pady=(2, 0))
-        v_tok, _ = entry(p3, "Personal access token (preferred - leave blank to use password)",
-                         self.config.get("access_token", ""), show="•")
-        v_trig, _ = entry(p3, "Trigger word", self.config.get("trigger_word", "@reminder"), width=18)
-        hint(p3, "Any message containing the trigger word - sent by you, or mentioning "
-                 "you - becomes a note. Add !urgent / !high / !low to set its priority.")
-        hint(p3, f"Credentials are stored in plain text in {CONFIG_FILE}. "
-                 f"A personal access token is safer than your password: revoke it "
-                 f"any time from Mattermost without changing your login.")
-        self._btn(p3, "Reconnect now", self.connect_mattermost).pack(anchor="w", pady=8)
+        # ── Connectors ──
+        # Built entirely from CONNECTORS: each class describes its own fields
+        # and setup steps, so a new connector needs no code here.
+        p3 = page("Connectors")
+        section(p3, "Turn chat messages into notes")
+        hint(p3, "A message containing the trigger word becomes a note when you wrote "
+                 "it, when it mentions you, or when it was sent to you directly. "
+                 "Add !urgent, !high or !low to the message to set the priority.")
+        v_trig, _ = entry(p3, "Trigger word", self.config.get("trigger_word", "@reminder"),
+                          width=18)
+        v_reply = check(p3, "When I mark one of these notes done, reply in the thread "
+                            "it came from", "reply_on_done")
+
+        conn_vars = {}                    # config key -> the variable editing it
+        conn_frames = {}
+        first_on = next((c.key for c in CONNECTORS if self.config.get(c.enabled_key)),
+                        CONNECTORS[0].key)
+        which = tk.StringVar(value=first_on)
+        switch = tk.Frame(p3, bg=T.panel)
+        switch.pack(anchor="w", pady=(16, 8))
+        host = tk.Frame(p3, bg=T.panel)   # holds whichever connector is selected
+        host.pack(anchor="w", fill="x")
+
+        def conn_values():
+            """What the connector fields hold right now, as config values."""
+            out = {"trigger_word": v_trig.get().strip() or "@reminder"}
+            for key, var in conn_vars.items():
+                val = var.get()
+                # tokens and URLs never have meaningful edge spaces; a password may
+                out[key] = val.strip() if isinstance(val, str) and key != "password" else val
+            return out
+
+        for cls in CONNECTORS:
+            fr = tk.Frame(host, bg=T.panel)
+            conn_frames[cls.key] = fr
+            conn_vars[cls.enabled_key] = check(fr, f"Connect to {cls.label}", cls.enabled_key)
+            secrets = []
+            for key, label, kind in cls.FIELDS:
+                if kind == "check":
+                    conn_vars[key] = check(fr, label, key)
+                else:
+                    conn_vars[key], field = entry(fr, label, self.config.get(key, "") or "",
+                                                  width=46,
+                                                  show="•" if kind == "secret" else None)
+                    if kind == "secret":
+                        secrets.append(field)
+            if secrets:
+                reveal = tk.BooleanVar(value=False)
+                tk.Checkbutton(
+                    fr, text="Show", variable=reveal, font=self.font_tiny, bg=T.panel,
+                    fg=T.fg_faint, selectcolor=T.panel2, bd=0, highlightthickness=0,
+                    activebackground=T.panel, cursor="hand2",
+                    command=lambda fs=secrets, r=reveal: [
+                        f.config(show="" if r.get() else "•") for f in fs]
+                ).pack(anchor="w", pady=(2, 0))
+
+            trow = tk.Frame(fr, bg=T.panel)
+            trow.pack(anchor="w", fill="x", pady=(10, 2))
+            result = tk.Label(trow, text="", font=self.font_tiny, bg=T.panel,
+                              fg=T.fg_faint, wraplength=380, justify="left", anchor="w")
+
+            def run_test(cls=cls, result=result):
+                trial = dict(self.config)
+                trial.update(conn_values())
+                if not cls.configured(trial):
+                    result.config(text="Fill in the fields above first.", fg=T.warn)
+                    return
+                result.config(text="Testing…", fg=T.fg_faint)
+
+                def work():
+                    try:
+                        ok, msg = True, cls.test(trial)
+                    except ConnectorError as e:
+                        ok, msg = False, str(e)
+                    except Exception as e:
+                        ok, msg = False, f"Could not connect: {e}"
+                    self.post(lambda: result.winfo_exists() and result.config(
+                        text=msg, fg=T.ok if ok else T.err))
+
+                threading.Thread(target=work, daemon=True).start()
+
+            self._btn(trow, "Test connection", run_test, font=self.font_tiny,
+                      pad=(10, 4)).pack(side="left", padx=(0, 10))
+            result.pack(side="left", fill="x", expand=True)
+
+            section(fr, f"Setting up {cls.label}")
+            hint(fr, cls.HELP)
+
+        def show_connector():
+            for key, fr in conn_frames.items():
+                fr.pack_forget()
+            conn_frames[which.get()].pack(anchor="w", fill="x")
+
+        self._chip_group(switch, which, [(c.key, c.label) for c in CONNECTORS],
+                         command=show_connector)
+        show_connector()
+        hint(p3, "Tokens and passwords are stored encrypted in config.json. They can "
+                 "only be read by your Windows account on this PC.")
 
         # ── System ──
         p4 = page("System")
@@ -3931,7 +5402,16 @@ class StickyNotesApp:
                   font=self.font_tiny, pad=(10, 4)).pack(side="left", padx=(0, 6))
         self._btn(mrow2, "Open data folder",
                   lambda: os.startfile(SCRIPT_DIR),
+                  font=self.font_tiny, pad=(10, 4)).pack(side="left", padx=(0, 6))
+        self._btn(mrow2, "Open backups", self.open_backups,
                   font=self.font_tiny, pad=(10, 4)).pack(side="left")
+        hint(p4, f"Your notes are copied to the backups folder once a day and the "
+                 f"last {BACKUP_KEEP} days are kept. To bring notes back, use "
+                 f"File → Import from JSON and pick a backup; notes you still have "
+                 f"are skipped.")
+
+        if tab in pages:
+            nb.select(pages[tab])
 
         # ── save bar ──
         bar = tk.Frame(w, bg=T.panel, padx=12, pady=10)
@@ -3944,6 +5424,18 @@ class StickyNotesApp:
                 messagebox.showwarning("Interval", "Interval must be a whole number of minutes.",
                                        parent=w)
                 return
+            quiet = {}
+            for key, var, fallback in (("quiet_start", v_qs, "22:00"),
+                                       ("quiet_end", v_qe, "08:00")):
+                value = var.get().strip() or fallback
+                # a mistyped time used to be accepted and silently ignored later
+                if not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", value):
+                    messagebox.showwarning("Quiet hours",
+                                           "Quiet hours need times like 22:00 and 08:00.",
+                                           parent=w)
+                    return
+                quiet[key] = value
+            before = dict(self.config)
             self.config.update({
                 "reminder_interval_minutes": iv_val,
                 "reminders_enabled": v_rem.get(),
@@ -3952,23 +5444,29 @@ class StickyNotesApp:
                 "focus_steal": v_focus.get(),
                 "popup_style": v_style.get(),
                 "quiet_hours_enabled": v_quiet.get(),
-                "quiet_start": v_qs.get().strip() or "22:00",
-                "quiet_end": v_qe.get().strip() or "08:00",
-                "mattermost_enabled": v_mm.get(),
-                "mattermost_url": v_url.get().strip(),
-                "username": v_user.get().strip(),
-                "password": v_pass.get(),
-                "access_token": v_tok.get().strip(),
-                "trigger_word": v_trig.get().strip() or "@reminder",
+                "reply_on_done": v_reply.get(),
                 "start_minimized": v_min.get(),
                 "close_to_tray": v_tray.get(),
             })
+            self.config.update(quiet)
+            self.config.update(conn_values())
             save_config(self.config)
             self.next_reminder = datetime.now() + timedelta(minutes=iv_val)
-            if self.config["mattermost_enabled"]:
-                self.connect_mattermost()
-            else:
-                self.disconnect_mattermost()
+            # Restart only the connectors whose own settings changed. Signing
+            # in again on every unrelated save could trip a server's
+            # too-many-logins lockout.
+            for cls in CONNECTORS:
+                keys = [cls.enabled_key, "trigger_word"] + [f[0] for f in cls.FIELDS]
+                changed = any(before.get(k) != self.config.get(k) for k in keys)
+                live = self.connectors.get(cls.key)
+                if self.config.get(cls.enabled_key):
+                    if changed or live is None or not live.running:
+                        self.connect(cls.key)
+                else:
+                    if live is not None:
+                        self.connectors.pop(cls.key).stop()
+                    self.conn_state.pop(cls.key, None)
+            self._paint_status()
             self._refresh_mute_ui()
             self.render_notes()
             w.destroy()
