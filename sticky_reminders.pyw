@@ -1,9 +1,15 @@
 """
-Sticky Reminders  -  v2.3
-=========================
+Sticky Reminders  -  v2.3.1
+===========================
 A desktop sticky-notes + reminder app. Messages from Mattermost, Slack,
 Discord and Telegram can become notes, and marking a note done replies in
 the thread it came from.
+
+The full history is in CHANGELOG.md. Recent versions:
+
+What changed in v2.3.1:
+  * Windows opened from the app (suggested notes, a new note) come up in
+    front of the main window, which no longer loses its maximised state
 
 What changed in v2.3:
   * Optional AI assistant: Claude, OpenAI, Gemini, or any OpenAI-compatible
@@ -77,10 +83,11 @@ import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 APP_NAME = "Sticky Reminders"
-APP_VERSION = "2.3"
-# Sent to the chat services as part of the User-Agent. Point it at the
-# project's repository once it has one.
-APP_HOMEPAGE = "https://github.com/"
+# The one place the version lives. Releases are tagged v<this> and described
+# in CHANGELOG.md; tools/release_notes.py checks that all three agree.
+APP_VERSION = "2.3.1"
+# The project's home. Sent to the chat services as part of the User-Agent.
+APP_HOMEPAGE = "https://github.com/UmarAbdullah4/sticky-reminders"
 
 # ─── Paths ───
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -600,8 +607,34 @@ def dark_titlebar(win):
         pass
 
 
-def force_foreground(win):
+def is_topmost(win):
+    """Is this window set to stay above all others (a pinned note)?"""
+    try:
+        return str(win.attributes("-topmost")).strip().lower() in ("1", "true")
+    except Exception:
+        return False
+
+
+def is_foreground(win):
+    """Is this already the window the user is working in?"""
+    try:
+        if win.state() in ("iconic", "withdrawn"):
+            return False
+        u = ctypes.windll.user32
+        return u.GetForegroundWindow() == (u.GetParent(win.winfo_id()) or win.winfo_id())
+    except Exception:
+        return False
+
+
+def force_foreground(win, focus=None):
     """Raise `win` to the *front*, not merely un-minimise it.
+
+    Safe to call on any of the app's windows: it leaves a maximised or
+    snapped window as it is, keeps a pinned note pinned, and keeps the
+    keyboard focus on whatever widget inside the window had it. For a
+    window that is only just being built, say which widget should get the
+    focus with `focus` - nothing inside it has had the focus yet, and
+    focusing the bare window would cancel the request Tk has queued for it.
 
     Windows refuses SetForegroundWindow to a process that does not own the
     current foreground window, so deiconify()+lift()+focus_force() restores the
@@ -610,17 +643,22 @@ def force_foreground(win):
     that restriction; the brief -topmost flick is the fallback when it does not.
     """
     try:
-        win.deiconify()
-        win.state("normal")
+        # Never force the "normal" state: that un-maximised a maximised
+        # window every time it was raised. A hidden window is shown again
+        # here; a minimised one is restored further down by Windows itself,
+        # which puts it back maximised if that is how it was (Tk's own
+        # deiconify does not).
+        if win.state() == "withdrawn":
+            win.deiconify()
         win.lift()
     except Exception:
         return
     try:
-        import ctypes
         u = ctypes.windll.user32
         win.update_idletasks()
         hwnd = u.GetParent(win.winfo_id()) or win.winfo_id()
-        u.ShowWindow(hwnd, 9)  # SW_RESTORE
+        if u.IsIconic(hwnd):
+            u.ShowWindow(hwnd, 9)  # SW_RESTORE
         fg = u.GetForegroundWindow()
         cur = u.GetWindowThreadProcessId(fg, None)
         own = ctypes.windll.kernel32.GetCurrentThreadId()
@@ -633,12 +671,24 @@ def force_foreground(win):
                 u.AttachThreadInput(cur, own, False)
     except Exception:
         pass
+    try:
+        if win.state() == "iconic":       # the Windows call above did not happen
+            win.deiconify()
+    except Exception:
+        pass
     # Fallback for the cases Windows still blocks: a momentary topmost flick
     # pulls the window out from behind other apps without pinning it there.
+    #
+    # While the flick lasts this window is above every ordinary window,
+    # including one of ours opened a moment later - so a window opened right
+    # after the main one is raised must be raised with this function too, or
+    # it is left behind when the flick ends.
     try:
-        win.attributes("-topmost", True)
-        win.after(250, lambda: win.attributes("-topmost", False))
-        win.focus_force()
+        if not is_topmost(win):           # a pinned note is topmost already: leave it so
+            win.attributes("-topmost", True)
+            win.after(250, lambda: win.winfo_exists() and win.attributes("-topmost", False))
+        # focus the widget asked for, else the one inside that last had it
+        (focus or win.focus_lastfor() or win).focus_force()
     except Exception:
         pass
 
@@ -1968,7 +2018,7 @@ class TaskPanel:
         d.minsize(340, 240)
         d.transient(self.top)
         try:
-            d.attributes("-topmost", bool(self.top.attributes("-topmost")))
+            d.attributes("-topmost", is_topmost(self.top))
         except tk.TclError:
             pass
         d.after(60, lambda: dark_titlebar(d))
@@ -2028,7 +2078,7 @@ class TaskPanel:
         d.minsize(300, 300)
         d.transient(self.top)
         try:                              # stay above a pinned note
-            d.attributes("-topmost", bool(self.top.attributes("-topmost")))
+            d.attributes("-topmost", is_topmost(self.top))
         except tk.TclError:
             pass
         d.after(60, lambda: dark_titlebar(d))
@@ -4289,7 +4339,16 @@ class StickyNotesApp:
 
     # ─────────────── window state ───────────────
     def show_window(self):
+        """Bring the main window to the front. If it is already the window
+        you are working in there is nothing to do - and raising it again
+        would put it in front of a window that was just opened from it."""
+        if is_foreground(self.root):
+            return
+        was_hidden = self.root.state() == "withdrawn"
         force_foreground(self.root)
+        if was_hidden and getattr(self, "_zoomed", False):
+            # Tk forgets "maximised" once a window is hidden to the tray
+            self.root.state("zoomed")
 
     def _remember_geometry(self):
         try:
@@ -4304,6 +4363,11 @@ class StickyNotesApp:
     def hide_window(self):
         """Get the window out of the way without stopping the app."""
         self._remember_geometry()
+        try:
+            if self.root.state() != "withdrawn":
+                self._zoomed = self.root.state() == "zoomed"   # see show_window()
+        except Exception:
+            pass
         if self.tray.available and self.config.get("close_to_tray", True):
             self.root.withdraw()
         else:
@@ -5280,9 +5344,7 @@ class StickyNotesApp:
         if already is not None and already.winfo_exists():
             # One window per note. Two editors on the same note each kept their
             # own copy of the text, and the last keystroke in either one won.
-            already.deiconify()
-            already.lift()
-            already.focus_force()
+            force_foreground(already)
             return
         from_chat = is_chat(note)
         is_done = note.get("done", False)
@@ -5665,6 +5727,14 @@ class StickyNotesApp:
 
         txt.bind("<KeyRelease>", on_change)
         p.protocol("WM_DELETE_WINDOW", close)
+        # Last, once everything exists: put the note in front of the main
+        # window even if that one was raised a moment ago to open it, with
+        # the cursor where you would start typing.
+        if view["now"] == "tasks" and panel.add_entry is not None:
+            start_in = panel.add_entry
+        else:
+            start_in = None if is_done else txt
+        force_foreground(p, focus=start_in)
 
         def repaint():
             """Restyle the open note for the current `col`."""
@@ -6067,11 +6137,10 @@ class StickyNotesApp:
             self._fill_suggestions()
 
     def open_suggestions(self):
-        self.show_window()
+        # A window of its own: it does not need the main window raised first
+        # (doing that left this one sitting behind it).
         if self._suggest_win is not None and self._suggest_win.winfo_exists():
-            self._suggest_win.deiconify()
-            self._suggest_win.lift()
-            self._suggest_win.focus_force()
+            force_foreground(self._suggest_win)
             return
         w = tk.Toplevel(self.root)
         self._suggest_win = w
@@ -6120,8 +6189,7 @@ class StickyNotesApp:
         outer.bind("<Leave>", lambda e: self.root.bind_all("<MouseWheel>", self._main_wheel))
         self._suggest_body = body
         self._fill_suggestions()
-        w.lift()
-        w.focus_force()
+        force_foreground(w)
 
     def _fill_suggestions(self):
         body = self._suggest_body
