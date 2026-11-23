@@ -227,6 +227,10 @@ def mm_route(call):
         return 200, {"id": "me1", "username": "alex"}, None
     if call["path"].endswith("/posts"):
         return 201, {"id": "newpost"}, None
+    if call["path"].endswith("/users/usernames"):      # which of these @words are real users?
+        if "ghost" in call["body"]:
+            return 500, {"message": "the server is having a moment"}, None
+        return 200, [{"id": "u9", "username": n} for n in call["body"] if n == "sara"], None
     return 404, {"message": "nope"}, None
 
 
@@ -812,6 +816,45 @@ cand = box.notes[0]
 check("an offered message says where it came from, so a note can reply there",
       (cand["sender"], cand["channel"], cand["channel_id"], cand["post_id"], cand["thread_id"],
        cand["source"]) == ("sara", "Town Square", "ch1", "c2", "c2", "mattermost"), str(cand))
+
+# Mattermost: whose reminder is it? A tagged message belongs to whoever it is
+# addressed to - and when I address one to somebody else, it is not also mine.
+n0 = len(box.notes)
+
+
+def mm_tag(text, user, pid, ctype="O", name="town-square"):
+    mm_ws.send({"event": "posted", "data": {
+        "sender_name": "@alex" if user == "me1" else "@sara",
+        "channel_display_name": "Town Square", "channel_type": ctype, "channel_name": name,
+        "post": json.dumps({"id": pid, "user_id": user, "channel_id": "ch1", "message": text,
+                            "root_id": ""})}})
+
+
+mm_tag("@reminder send me the contract", "other", "d1", "D", "me1__other")       # sent to me directly
+mm_tag("@reminder something for the group chat", "other", "d2", "G", "a1b2c3")   # group, nobody named
+mm_tag("@reminder send the contract to legal", "me1", "d3", "D", "me1__other")   # I sent it to them
+mm_tag("@reminder buy milk", "me1", "d4", "D", "me1__me1")                         # my chat with myself
+mm_tag("@reminder @sara send the report", "me1", "d5")                             # I named a colleague
+mm_tag("@reminder @sara and @alex sync on Friday", "me1", "d6")                    # ...and myself
+mm_tag("@reminder set the @home thermostat, mail ops@example.com", "me1", "d7")   # no user called that
+mm_tag("@reminder @ghost check the logs", "me1", "d8")                             # server cannot say
+box.wait_notes(n0 + 5)
+box.settle(0.8)
+got = [(m["text"], m["is_self"], m["channel"]) for m in box.notes[n0:]]
+check("a direct message with the trigger reaches me without an @mention; a group chat still needs one",
+      got[:1] == [("send me the contract", False, "direct message")]
+      and not any("group chat" in t for t, _, _ in got), str(got))
+check("a reminder I send to someone else is theirs, not mine (direct message, or naming them)",
+      not any("contract to legal" in t or t == "@sara send the report" for t, _, _ in got), str(got))
+check("...but my own stay mine: note to self, naming myself too, or an @word that is no user",
+      got[1:4] == [("buy milk", True, "direct message"),
+                   ("@sara and sync on Friday", True, "Town Square"),
+                   ("set the @home thermostat, mail ops@example.com", True, "Town Square")], str(got))
+check("if the server cannot say who is a user, the note is kept rather than dropped",
+      got[4:] == [("@ghost check the logs", True, "Town Square")], str(got))
+asked = [c["body"] for c in mm_http.named("/users/usernames")]
+check("the server is asked only about unknown @words, once each",
+      asked == [["sara"], ["home"], ["ghost"]], str(asked))
 mm.stop()
 
 # Mattermost: thread history
@@ -875,6 +918,16 @@ check("Slack, assistant on: mentions and DMs from others are offered, nothing el
 check("Slack candidate keeps channel and thread",
       (box.notes[0]["channel"], box.notes[0]["post_id"], box.notes[1]["channel"]) ==
       ("launch", "31.1", "direct message"))
+
+n0 = len(box.notes)
+sl_event(sl_msg("@reminder <@U2> please send the deck", user="UME", ts="40.1"))
+sl_event(sl_msg("@reminder <@U2> and <@UME> pair on this", user="UME", ts="41.1"))
+sl_event(sl_msg("@reminder nobody addressed, so it is mine", user="UME", ts="42.1"))
+box.wait_notes(n0 + 2)
+box.settle(0.6)
+got = [(m["text"], m["is_self"]) for m in box.notes[n0:]]
+check("Slack: a reminder I address to someone else is theirs; one naming me too, or nobody, is mine",
+      got == [("@Bob Stone and pair on this", True), ("nobody addressed, so it is mine", True)], str(got))
 sl.stop()
 
 # Slack: thread history
@@ -935,6 +988,17 @@ box.settle(0.6)
 check("Discord, assistant on: mentions and DMs from others are offered, nothing else",
       kinds(box) == [("candidate", "could you merge my branch today?"),
                      ("candidate", "can you DM me the invite link?")], str(kinds(box)))
+
+n0 = len(box.notes)
+bob_ping = [{"id": "222", "username": "bob", "global_name": "Bob"}]
+dc_msg("@reminder <@222> please review", author="1001", mentions=bob_ping, mid="o6")
+dc_msg("@reminder <@222> and <@1001> pair up", author="1001", mentions=bob_ping + me_ping, mid="o7")
+dc_msg("@reminder mine, nobody addressed", author="1001", mid="o8")
+box.wait_notes(n0 + 2)
+box.settle(0.6)
+got = [(m["text"], m["is_self"]) for m in box.notes[n0:]]
+check("Discord: a reminder I address to someone else is theirs; one naming me too, or nobody, is mine",
+      got == [("@Bob and pair up", True), ("mine, nobody addressed", True)], str(got))
 dc.stop()
 
 # Discord: history

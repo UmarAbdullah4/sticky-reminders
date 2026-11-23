@@ -9,6 +9,31 @@ new features, **patch** for fixes.
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-11-23
+
+### Added
+- A Windows installer. `StickyReminders-Setup-2.4.0.exe` installs the app like
+  any other program: Start menu and desktop shortcuts, an option to start with
+  Windows, and an entry under Settings → Apps to remove it. It needs neither
+  Python nor administrator rights. A portable zip of the same program is
+  published next to it.
+- The installed program offers to take over from a copy run with Python: it
+  stops the old copy, carries its settings and sign-ins across, and takes over
+  starting with Windows. Notes are shared by both, so nothing is lost.
+- The app has its own icon, on its windows and on the taskbar.
+- `--self-test`, which checks that a copy of the app can run without touching
+  your notes or settings. The installer build runs it on the packaged program.
+
+### Changed
+- A reminder is now a note for whoever it is addressed to. In Mattermost, a
+  direct message containing the trigger word reaches the other person without
+  an @mention.
+- A reminder you address to someone else, by direct message or by mentioning
+  them, is theirs alone: it no longer also appears on your own list. Mention
+  yourself as well to keep a copy. This applies to Mattermost, Slack and Discord.
+- When installed, settings are kept in `%APPDATA%\StickyReminders`. Run from
+  source, they stay next to the script as before.
+
 ## [2.3.1] - 2026-11-23
 
 ### Fixed
@@ -122,7 +147,8 @@ The first version, "Sticky Notes Reminder".
   confirmation back to the channel.
 - Start with Windows.
 
-[Unreleased]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.3.1...HEAD
+[Unreleased]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.4.0...HEAD
+[2.4.0]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.3.1...v2.4.0
 [2.3.1]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/UmarAbdullah4/sticky-reminders/compare/v2.1.0...v2.2.0

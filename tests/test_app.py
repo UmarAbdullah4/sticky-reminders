@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import time
 import traceback
@@ -174,6 +175,135 @@ try:
     check("repeat: none, and no due date",
           nx(fri, "", now) is None and nx(None, "daily", now) == now + timedelta(days=1))
 
+    # ── how the app is launched and packaged ──
+    print("-- packaging --")
+    program, arguments, folder = mod.launch_command()
+    check("from source, the app relaunches itself as pythonw + this script",
+          not mod.FROZEN and program.lower().endswith("pythonw.exe")
+          and arguments.startswith('"') and arguments.endswith('sticky_reminders.pyw"')
+          and folder == mod.SCRIPT_DIR, f"{program} {arguments}")
+    check("a copy run from source and an installed copy use different login shortcuts",
+          os.path.basename(mod.SHORTCUT_PATH) == "StickyReminders.lnk")
+    check("the app icon is where the app looks for it", os.path.isfile(mod.ICON_FILE), mod.ICON_FILE)
+    st = os.path.join(OUT, "selftest")
+    code = subprocess.run([sys.executable, "-B", mod.__file__, "--self-test", st]).returncode
+    report = json.load(open(os.path.join(st, "self_test.json"), encoding="utf-8"))
+    check("the built-in self-test passes (the same one the installer build runs on the .exe)",
+          code == 0 and report["passed"] and report["version"] == mod.APP_VERSION
+          and not report["packaged"], json.dumps(report["checks"]))
+
+    # ── the installed program taking over from a copy run from source ──
+    print("-- taking over from a copy run from source --")
+    ss = mod.source_script
+    check("a command line counts as the app only when the app is what it runs",
+          ss(r'"C:\Py\pythonw.exe" "C:\Apps\Sticky Notes\sticky_reminders.pyw"')
+          == r"C:\Apps\Sticky Notes\sticky_reminders.pyw"
+          and ss(r"C:\Py\pythonw.exe C:\Apps\sticky_reminders.pyw --show") == r"C:\Apps\sticky_reminders.pyw"
+          and ss(r'python -B "C:\Apps\STICKY_REMINDERS.PYW"') == r"C:\Apps\STICKY_REMINDERS.PYW"
+          and ss(r"python -B tests\test_app.py C:\Apps\sticky_reminders.pyw") is None
+          and ss(r"python C:\Apps\sticky_reminders.pyw --self-test C:\tmp") is None
+          and ss(r"python C:\Apps\other.pyw") is None and ss("python") is None and ss("") is None)
+
+    # From here on the "copy run from source" is a stand-in under a name of its
+    # own, so that nothing below can mistake the real app for it and stop it.
+    mod.SOURCE_SCRIPT = f"sticky_standin_{os.getpid()}.pyw"
+    old_home = os.path.join(OUT, "old copy")                 # a folder name with a space in it
+    new_home = os.path.join(OUT, "installed settings")
+    logins = os.path.join(OUT, "logins")
+    os.makedirs(old_home)
+    os.makedirs(logins)
+    standin = os.path.join(old_home, mod.SOURCE_SCRIPT)
+    write(standin, "import time\ntime.sleep(300)\n")
+    write(os.path.join(old_home, "config.json"),
+          json.dumps({"trigger_word": "@todo", "password": mod.protect("pw-from-the-old-copy")}))
+    mod.SOURCE_SHORTCUT = os.path.join(logins, "StickyReminders.lnk")
+    mod.SHORTCUT_PATH = os.path.join(logins, "Sticky Reminders.lnk")
+    harness_config = (mod.CONFIG_DIR, mod.CONFIG_FILE)
+    mod.CONFIG_DIR, mod.CONFIG_FILE = new_home, os.path.join(new_home, "config.json")
+
+    def old_login_shortcut():
+        ps = (f"$s=(New-Object -COM WScript.Shell).CreateShortcut('{mod.SOURCE_SHORTCUT}');"
+              f"$s.TargetPath='{mod.PYTHONW}';$s.Arguments='\"{standin}\"';$s.Save()")
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True, capture_output=True)
+
+    asked, looked, answer = [], [], {"yes": True}
+    mod.message_box = lambda text, question=False: (asked.append((question, text)), answer["yes"])[1]
+    real_find, real_stop = mod.find_source_copy, mod.stop_processes
+    mod.find_source_copy = lambda: (looked.append(1), real_find())[1]
+
+    class Guard:
+        took_over = 0
+
+        def take_over(self):
+            Guard.took_over += 1
+            return True
+
+    old_login_shortcut()
+    old = subprocess.Popen([sys.executable, standin])
+    try:
+        time.sleep(1.0)
+        found = real_find()
+        check("a copy run from source is found: its process, its login shortcut and its folder",
+              bool(found) and old.pid in found["pids"] and found["at_login"]
+              and found["folder"] == old_home, str(found))
+
+        mod.stop_processes = lambda pids, wait=5.0: False
+        still = mod.settle_source_copy(Guard(), False)
+        check("if the old copy cannot be stopped, the app says so, changes nothing and will ask again",
+              still is False and [q for q, _ in asked] == [True, False] and "running now" in asked[0][1]
+              and old.poll() is None and os.path.exists(mod.SOURCE_SHORTCUT)
+              and not os.path.exists(mod.CONFIG_FILE) and Guard.took_over == 0, str(asked))
+        mod.stop_processes = real_stop
+
+        now_first = mod.settle_source_copy(Guard(), False)
+        time.sleep(0.3)
+        cfg = mod.load_config()
+        check("on Yes the old copy is stopped and this one takes its place",
+              now_first is True and Guard.took_over == 1 and old.poll() is not None)
+        check("...its settings and sign-ins are carried over",
+              cfg["trigger_word"] == "@todo" and cfg["password"] == "pw-from-the-old-copy"
+              and cfg.get("source_copy_settled") is True, str({k: cfg.get(k) for k in ("trigger_word",)}))
+        check("...and its start-at-login entry is replaced by this program's",
+              not os.path.exists(mod.SOURCE_SHORTCUT) and os.path.exists(mod.SHORTCUT_PATH))
+        check("stopping a process that has already gone is not an error", real_stop([old.pid]) is True)
+
+        asked.clear()
+        looked.clear()
+        check("once settled, it is never looked for or asked about again",
+              mod.settle_source_copy(Guard(), False) is False and asked == [] and looked == [])
+    finally:
+        if old.poll() is None:
+            old.kill()
+
+    # only the login shortcut is left (the old copy is not running), and the answer is No
+    shutil.rmtree(new_home)
+    os.remove(mod.SHORTCUT_PATH)
+    old_login_shortcut()
+    answer["yes"] = False
+    first = mod.settle_source_copy(Guard(), True)
+    cfg = mod.load_config()
+    check("on No nothing is touched, and the question is asked only that once",
+          first is True and len(asked) == 1 and "running now" not in asked[0][1]
+          and os.path.exists(mod.SOURCE_SHORTCUT) and not os.path.exists(mod.SHORTCUT_PATH)
+          and cfg["trigger_word"] == "@reminder" and cfg.get("source_copy_settled") is True
+          and mod.settle_source_copy(Guard(), True) is True and len(asked) == 1, str(asked))
+
+    shutil.rmtree(new_home)
+    answer["yes"] = True
+    first = mod.settle_source_copy(Guard(), True)
+    check("with the old copy not running, its folder is read from its login shortcut",
+          first is True and mod.load_config()["trigger_word"] == "@todo"
+          and not os.path.exists(mod.SOURCE_SHORTCUT) and os.path.exists(mod.SHORTCUT_PATH)
+          and Guard.took_over == 1)
+
+    shutil.rmtree(new_home)
+    asked.clear()
+    looked.clear()
+    check("a PC with no sign of an old copy is not searched and nobody is asked anything",
+          mod.settle_source_copy(Guard(), True) is True and asked == [] and looked == []
+          and mod.load_config().get("source_copy_settled") is True)
+    mod.CONFIG_DIR, mod.CONFIG_FILE = harness_config
+
     # ── single instance ──
     print("-- single instance --")
     shown = []
@@ -187,6 +317,13 @@ try:
         c.sendall(b"GET / HTTP/1.0\r\n\r\n")
         time.sleep(0.3)
     check("a stray connection does not pop the window", shown == [1])
+    # the first copy goes away (as when the installed program stops an old copy)
+    a.sock.close()
+    b.on_show = lambda: shown.append("b")
+    check("after the first copy has gone, the second can take its place and answer the doorbell",
+          b.take_over(wait=3) is True and mod.SingleInstance.signal_existing() is True
+          and (time.sleep(0.2) or shown == [1, "b"]), str(shown))
+    b.sock.close()
     # a different program owns the port: the app must still start
     squatter = socket.socket()
     squatter.bind(("127.0.0.1", 0))

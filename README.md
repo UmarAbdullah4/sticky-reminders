@@ -4,11 +4,15 @@
 [![Latest release](https://img.shields.io/github/v/release/UmarAbdullah4/sticky-reminders)](https://github.com/UmarAbdullah4/sticky-reminders/releases/latest)
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 
-A desktop sticky-notes and reminder app for Windows, in a single Python file.
+A desktop sticky-notes and reminder app for Windows. Install it like any other
+program, or run it from source: the whole app is a single Python file.
 
 Notes can hold tasks with their own progress, due dates repeat, and messages
 from Mattermost, Slack, Discord and Telegram can turn into notes on their own.
 When you mark such a note done, the app replies in the thread it came from.
+
+**[Download the latest version](https://github.com/UmarAbdullah4/sticky-reminders/releases/latest)**
+and see [Install](#install).
 
 ![The main window: coloured notes with tasks, progress and due dates](docs/screenshots/main.png)
 
@@ -39,8 +43,9 @@ The screenshots show made-up demo data.
 
 **Connectors**
 - Mattermost, Slack, Discord, Telegram
-- A message containing the trigger word (default `@reminder`) becomes a note when
-  you wrote it, when it mentions you, or when it was sent to you directly
+- A message containing the trigger word (default `@reminder`) becomes a note for
+  whoever it is meant for: yourself if nobody else is addressed, otherwise the
+  person you mention or message directly
 - Add `!urgent`, `!high` or `!low` to the message to set the note's priority
 - Marking the note done posts a reply in the original thread (can be switched off)
 
@@ -61,11 +66,45 @@ The screenshots show made-up demo data.
 - Export to Markdown or JSON, import from JSON
 - Tokens and passwords are encrypted on disk with Windows DPAPI
 
-## Requirements
+## Install
 
-- Windows 10 or 11
-- Python 3 with Tk (included in the python.org installer). Developed and tested
-  on Python 3.14; earlier 3.x versions are untested.
+For Windows 10 or 11.
+
+**With the installer.** From the
+[latest release](https://github.com/UmarAbdullah4/sticky-reminders/releases/latest),
+download `StickyReminders-Setup-x.y.z.exe` and double-click it. It installs for
+your Windows account only, so it asks for no administrator password. You get
+Start menu and desktop shortcuts and the option to start with Windows, and you
+remove it again under **Settings → Apps**. Python is not needed.
+
+The Setup file is not code-signed yet, so Windows is cautious the first time:
+
+- **"Windows protected your PC"**: choose **More info**, then **Run anyway**.
+- **"Smart App Control blocked an app that may be unsafe"**: that Windows
+  setting makes no exceptions for unsigned installers. Use the portable zip or
+  run from source instead.
+
+**Portable.** Download `StickyReminders-x.y.z-portable.zip`, unzip it anywhere
+and run `StickyReminders.exe`. Nothing is installed; delete the folder to
+remove it.
+
+**From source.** See [Running from source](#running-from-source).
+
+To update, run the newer Setup file over the old one. Your notes and settings
+are kept, as they are when you uninstall.
+
+### Moving from a copy run with Python
+
+If an earlier version is running with Python on the PC, the installed version
+offers to take over the first time it starts. Say yes and it stops the old copy,
+carries your settings and sign-ins across, and takes over starting with
+Windows. Both use the same notes file, so your notes are simply there. The old
+folder can be deleted afterwards.
+
+## Running from source
+
+You need Python 3 with Tk (included in the python.org installer). Developed and
+tested on Python 3.14; earlier 3.x versions are untested.
 
 The app runs on the standard library alone. Optional packages add features:
 
@@ -82,8 +121,6 @@ python -m pip install -r requirements.txt
 Telegram needs no extra package, and neither do the OpenAI, Gemini and
 open-source options of the assistant.
 
-## Running it
-
 ```
 pythonw sticky_reminders.pyw
 ```
@@ -91,19 +128,37 @@ pythonw sticky_reminders.pyw
 `pythonw` runs it without a console window. To start it with Windows, tick
 **Settings → System → Start automatically when I log in**.
 
-Command-line switches: `--show` opens the main window, `--reminder` shows the
-reminder list straight away.
+Command-line switches, for the installed program too: `--show` opens the main
+window, `--reminder` shows the reminder list straight away.
 
 ## Connectors
 
 Open **Settings → Connectors**, pick a service, fill in its fields and press
 **Test connection**. Each service's setup steps are shown on that page too.
 
+### Whose note is it?
+
+A message containing the trigger word becomes a note for whoever it is meant for.
+
+| You write | Where | Who gets the note |
+|---|---|---|
+| `@reminder call the bank` | anywhere | You |
+| `@reminder send me the report` | a direct message to Sara (Mattermost) | Sara |
+| `@reminder @sara send me the report` | a channel | Sara |
+| `@reminder @sara @you sync on Friday` | a channel | Both of you |
+
+The other person has to be running Sticky Reminders as well, connected to the
+same service and on version 2.4.0 or later. A reminder you address to someone
+else is theirs alone; mention yourself too if you want a copy. A word after `@`
+that is not anybody's username, like `@home`, does not count as addressing
+someone.
+
 ### Mattermost
 
 Sign in with your username and password, or better, a personal access token
-(Profile → Security → Personal Access Tokens). A message becomes a note when
-you sent it or it mentions you.
+(Profile → Security → Personal Access Tokens). Because you are signed in as
+yourself, the app sees your direct messages, which is what makes the second
+row of the table above work.
 
 If your server uses a self-signed certificate that you trust, untick
 *Verify the server's TLS certificate*.
@@ -224,8 +279,10 @@ those options are detected and asked the plain way.
 | Notes | `~/.sticky_reminders.json` (previous save in `.bak`) |
 | Suggested notes awaiting a decision | `~/.sticky_reminders_suggestions.json` |
 | Daily backups | `~/.sticky_reminders_backups/` |
-| Settings | `config.json`, next to the script |
+| Settings | `config.json`: in `%APPDATA%\StickyReminders` when installed, next to the script when run from source |
 | Log | `~/.sticky_reminders.log` |
+
+Uninstalling leaves all of these in place.
 
 `config.json` is listed in `.gitignore`. Credentials inside it are encrypted for
 your Windows account, so the file is no use on another PC or to another user,
@@ -261,6 +318,10 @@ python tests/test_windows.py      # window stacking, maximise state, pins, focus
 `test_connectors.py` needs `websockets`, `test_ai.py` needs `anthropic`, and the
 screenshots need `pillow`.
 
+`python tests/test_installer.py` is separate: it installs the built Setup file
+for real, checks what it put on the PC, and uninstalls it again. See
+[CONTRIBUTING.md](CONTRIBUTING.md#building-the-installer).
+
 The connector and assistant tests check the app against each service's
 documented wire format, using simulated servers and a scripted model, so they
 cost nothing to run. They cannot check the live services, or how well a real
@@ -270,7 +331,8 @@ model judges your messages.
 
 Releases follow [Semantic Versioning](https://semver.org) and are listed on the
 [Releases page](https://github.com/UmarAbdullah4/sticky-reminders/releases), each
-with the script attached as a single download. What changed in every version is
+with the Setup file, the portable zip, their SHA-256 checksums and the script
+itself attached. What changed in every version is
 in [CHANGELOG.md](CHANGELOG.md). The running version is shown under
 **Help → About**.
 

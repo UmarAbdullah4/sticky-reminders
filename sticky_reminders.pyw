@@ -1,11 +1,18 @@
 """
-Sticky Reminders  -  v2.3.1
+Sticky Reminders  -  v2.4.0
 ===========================
 A desktop sticky-notes + reminder app. Messages from Mattermost, Slack,
 Discord and Telegram can become notes, and marking a note done replies in
 the thread it came from.
 
 The full history is in CHANGELOG.md. Recent versions:
+
+What changed in v2.4.0:
+  * Can be installed like any Windows program: a Setup file with Start menu
+    and desktop shortcuts and an uninstaller, no Python needed
+  * A reminder sent to a colleague in a direct message reaches them without
+    an @mention, and a reminder addressed to someone else is theirs alone
+  * The app has its own icon on its windows and the taskbar
 
 What changed in v2.3.1:
   * Windows opened from the app (suggested notes, a new note) come up in
@@ -43,11 +50,15 @@ What changed in v2:
   * Menu bar, keyboard shortcuts, status bar, export
   * Atomic saves with backup, rotating log file
 
+Two ways to run it. Installed: the Setup file from the Releases page, which
+needs nothing else. From source, with Python:
+
 Requirements:  python -m pip install websockets pystray pillow
                (Windows only; the tray icon and the websocket connectors are
                optional - the app runs without either package)
                python -m pip install anthropic     (only for the Claude assistant)
-Config:        config.json (same folder; secrets inside it are encrypted)
+Config:        config.json - beside this file when run from source, in
+               %APPDATA%\\StickyReminders when installed (secrets in it are encrypted)
 Data:          ~/.sticky_reminders.json
 Backups:       ~/.sticky_reminders_backups/  (one per day, newest 14 kept)
 Log:           ~/.sticky_reminders.log
@@ -85,14 +96,27 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 APP_NAME = "Sticky Reminders"
 # The one place the version lives. Releases are tagged v<this> and described
 # in CHANGELOG.md; tools/release_notes.py checks that all three agree.
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.4.0"
 # The project's home. Sent to the chat services as part of the User-Agent.
 APP_HOMEPAGE = "https://github.com/UmarAbdullah4/sticky-reminders"
 
 # ─── Paths ───
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+# The app runs in one of two ways: from source (pythonw + this file), or as
+# the packaged program that the Windows installer puts on disk. A packaged
+# program must never write next to its own files, so its settings go in the
+# user's profile instead.
+FROZEN = bool(getattr(sys, "frozen", False))
 HOME = os.path.expanduser("~")
+if FROZEN:
+    SCRIPT_DIR = os.path.dirname(sys.executable)               # where it is installed
+    RESOURCE_DIR = getattr(sys, "_MEIPASS", SCRIPT_DIR)        # files bundled with it
+    CONFIG_DIR = os.path.join(os.environ.get("APPDATA") or HOME, "StickyReminders")
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    RESOURCE_DIR = SCRIPT_DIR
+    CONFIG_DIR = SCRIPT_DIR                                    # config.json beside the script
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+ICON_FILE = os.path.join(RESOURCE_DIR, "assets", "icon.ico")
 DATA_FILE = os.path.join(HOME, ".sticky_reminders.json")
 LOG_FILE = os.path.join(HOME, ".sticky_reminders.log")
 BACKUP_DIR = os.path.join(HOME, ".sticky_reminders_backups")
@@ -101,11 +125,21 @@ BACKUP_KEEP = 14
 SUGGEST_FILE = os.path.join(HOME, ".sticky_reminders_suggestions.json")
 STARTUP_DIR = os.path.join(HOME, "AppData", "Roaming", "Microsoft", "Windows",
                            "Start Menu", "Programs", "Startup")
-SHORTCUT_PATH = os.path.join(STARTUP_DIR, "StickyReminders.lnk")
+# The "start at login" shortcut. The packaged program and a copy run from
+# source use different names, so uninstalling one can never remove the
+# other's shortcut. (The installer creates and removes the first name.)
+SOURCE_SCRIPT = "sticky_reminders.pyw"            # what a copy run from source runs
+SOURCE_SHORTCUT = os.path.join(STARTUP_DIR, "StickyReminders.lnk")
+SHORTCUT_PATH = (os.path.join(STARTUP_DIR, "Sticky Reminders.lnk") if FROZEN
+                 else SOURCE_SHORTCUT)
 
 # The real interpreter, NOT the WindowsApps alias (the alias spawns a second
 # process that lingers - that is why two pythonw.exe used to show up).
 PYTHONW = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+
+# Identifies the app to Windows: its own taskbar button and icon, instead of
+# being grouped under Python's when it runs from source.
+APP_USER_MODEL_ID = "UmarAbdullah4.StickyReminders"
 
 SINGLE_INSTANCE_PORT = 49731
 
@@ -332,6 +366,7 @@ def save_config(cfg):
 
 
 def _atomic_write(path, text):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)   # first run of an installed copy
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
@@ -792,45 +827,195 @@ def source_label(n):
     return cls.label if cls else str(n.get("source") or "Chat").title()
 
 
-def run_hidden(args):
+def run_hidden(args, **options):
     """Run a command with no console flash."""
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    return subprocess.run(args, startupinfo=si, capture_output=True, text=True,
-                          creationflags=0x08000000)
+    return subprocess.run(args, startupinfo=si, capture_output=True, creationflags=0x08000000,
+                          **{"text": True, **options})
 
 
 def startup_enabled():
     return os.path.exists(SHORTCUT_PATH)
 
 
+def launch_command():
+    """(program, arguments, working folder) that starts this app: the
+    packaged .exe itself, or the real pythonw with this file when running
+    from source."""
+    if FROZEN:
+        return sys.executable, "", SCRIPT_DIR
+    script = os.path.join(SCRIPT_DIR, os.path.basename(__file__))
+    return PYTHONW, f'"{script}"', SCRIPT_DIR
+
+
 def set_startup(enable):
-    """Create/remove the login shortcut. Always targets the REAL interpreter so
-    only one process is created."""
+    """Create/remove the login shortcut. From source it targets the REAL
+    interpreter so only one process is created."""
     try:
         if not enable:
             if os.path.exists(SHORTCUT_PATH):
                 os.remove(SHORTCUT_PATH)
             return True, "Startup entry removed."
-        script = os.path.join(SCRIPT_DIR, os.path.basename(__file__))
+        exe, arguments, folder = launch_command()
         ps = (
             "$s=(New-Object -COM WScript.Shell).CreateShortcut('{lnk}');"
             "$s.TargetPath='{exe}';"
-            "$s.Arguments='\"{script}\"';"
+            "$s.Arguments='{args}';"
             "$s.WorkingDirectory='{wd}';"
             "$s.WindowStyle=7;"
             "$s.Description='Sticky Reminders';"
             "$s.Save()"
         ).format(lnk=SHORTCUT_PATH.replace("'", "''"),
-                 exe=PYTHONW.replace("'", "''"),
-                 script=script.replace("'", "''"),
-                 wd=SCRIPT_DIR.replace("'", "''"))
+                 exe=exe.replace("'", "''"),
+                 args=arguments.replace("'", "''"),
+                 wd=folder.replace("'", "''"))
         r = run_hidden(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
         if r.returncode != 0:
             return False, (r.stderr or "PowerShell failed").strip()[:200]
         return True, "Starts automatically at login (single process)."
     except Exception as e:
         return False, str(e)
+
+
+# ─── Taking over from a copy run from source ───
+# Before there was an installer the app was run with Python, and on some PCs
+# it still is: running now, or set to start at login. A second launch only
+# wakes the first copy, so without this the person who has just installed
+# the new version would go on using the old one and never know.
+
+def message_box(text, question=False):
+    """A plain Windows message box, for before the app has windows of its
+    own. For a question, returns whether the answer was Yes."""
+    flags = 0x00050000 | (0x24 if question else 0x30)     # in front; Yes/No, or a warning
+    return ctypes.windll.user32.MessageBoxW(None, text, APP_NAME, flags) == 6
+
+
+def split_command_line(command_line):
+    """A command line as its list of arguments, by Windows' own rules."""
+    from ctypes import wintypes
+    split = ctypes.windll.shell32.CommandLineToArgvW
+    split.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    split.restype = ctypes.POINTER(wintypes.LPWSTR)
+    count = ctypes.c_int(0)
+    parts = split(command_line, ctypes.byref(count))
+    if not parts:
+        return []
+    try:
+        return [parts[i] for i in range(count.value)]
+    finally:
+        free = ctypes.windll.kernel32.LocalFree
+        free.argtypes = [ctypes.c_void_p]
+        free(ctypes.cast(parts, ctypes.c_void_p))
+
+
+def source_script(command_line):
+    """The script a `python ...` command line runs, if that is this app being
+    run as the app - not something that merely mentions it, and not its
+    self-test. None otherwise."""
+    args = split_command_line(command_line)[1:]
+    script = next((a for a in args if not a.startswith("-")), "")
+    if os.path.basename(script).lower() != SOURCE_SCRIPT.lower() or "--self-test" in args:
+        return None
+    return script
+
+
+def find_source_copy():
+    """Signs of a copy of this app run from source on this PC: the processes
+    of one running now, whether one starts at login, and the folder it lives
+    in ('' if that cannot be told). None if there is no sign of one."""
+    lnk = SOURCE_SHORTCUT.replace("'", "''")
+    ps = ("[Console]::OutputEncoding=New-Object Text.UTF8Encoding $false;"
+          "$r=@{procs=@();lnk=''};"
+          "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | ForEach-Object "
+          "{$r.procs+=@{pid=[int]$_.ProcessId;cmd=[string]$_.CommandLine}};"
+          f"if(Test-Path -LiteralPath '{lnk}')"
+          f"{{$r.lnk=[string](New-Object -COM WScript.Shell).CreateShortcut('{lnk}').Arguments}};"
+          "ConvertTo-Json $r -Depth 4 -Compress")
+    try:
+        done = run_hidden(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                          encoding="utf-8", errors="replace", timeout=30)
+        seen = json.loads(done.stdout.lstrip("﻿"))
+    except Exception as e:
+        log.warning("Could not look for a copy run from source: %s", e)
+        return None
+    running = [(int(p["pid"]), source_script(p.get("cmd") or "")) for p in seen.get("procs") or []]
+    running = [(pid, script) for pid, script in running if script]
+    at_login = os.path.exists(SOURCE_SHORTCUT)
+    if not running and not at_login:
+        return None
+    scripts = [s for _, s in running] + [source_script("python " + (seen.get("lnk") or "")) or ""]
+    folder = next((os.path.dirname(s) for s in scripts if os.path.isabs(s)), "")
+    return {"pids": [pid for pid, _ in running], "at_login": at_login, "folder": folder}
+
+
+def stop_processes(pids, wait=5.0):
+    """End these processes. True once every one of them is gone."""
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenProcess.restype = ctypes.c_void_p
+    k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    for fn in (k.TerminateProcess, k.WaitForSingleObject):
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    gone = True
+    for pid in pids:
+        handle = k.OpenProcess(0x00100001, 0, int(pid))    # SYNCHRONIZE | PROCESS_TERMINATE
+        if not handle:
+            # 87 = no such process (it has gone already). Anything else, such
+            # as "access denied" for a copy started as administrator: still there.
+            gone = gone and ctypes.get_last_error() == 87
+            continue
+        k.TerminateProcess(handle, 0)
+        gone = k.WaitForSingleObject(handle, int(wait * 1000)) == 0 and gone
+        k.CloseHandle(handle)
+    return gone
+
+
+def settle_source_copy(guard, first):
+    """For the installed program, until it has been settled once: if a copy
+    run from source is on this PC, offer to take over from it - stop it,
+    bring its settings across, and move its start-at-login entry here.
+    `first` says whether this is the only copy running; returns the same,
+    as it stands afterwards."""
+    config = load_config()
+    if config.get("source_copy_settled"):
+        return first
+    # Nothing running and nothing set to start: there is no copy to look for.
+    found = find_source_copy() if (not first or os.path.exists(SOURCE_SHORTCUT)) else None
+    replace = bool(found) and message_box(
+        "An older copy of Sticky Reminders - the one that runs with Python - is on this PC"
+        + (", and it is running now" if found["pids"] else "") + ".\n\n"
+        "Use this installed version from now on?\n\n"
+        "Yes: the old copy is stopped and no longer starts with Windows. Your notes stay "
+        "exactly as they are, and your settings and sign-ins are carried over.\n\n"
+        "No: keep the old copy. You will not be asked again.", question=True)
+    if replace and not stop_processes(found["pids"]):
+        message_box("The old copy of Sticky Reminders could not be stopped.\n\n"
+                    "Quit it from its icon near the clock (right-click, Quit), then start "
+                    "Sticky Reminders again.")
+        return first                                  # nothing settled: ask again next time
+    if replace:
+        old = os.path.join(found["folder"], "config.json") if found["folder"] else ""
+        if old and os.path.isfile(old) and not os.path.exists(CONFIG_FILE):
+            try:
+                os.makedirs(CONFIG_DIR, exist_ok=True)
+                shutil.copy2(old, CONFIG_FILE)        # credentials in it are encrypted for this
+                config = load_config()                # Windows account, so they still open here
+                log.info("Settings carried over from %s", found["folder"])
+            except Exception as e:
+                log.error("Could not carry the settings over: %s", e)
+        if found["at_login"]:
+            try:
+                os.remove(SOURCE_SHORTCUT)
+                if not startup_enabled():
+                    set_startup(True)
+            except Exception as e:
+                log.error("Could not move the start-at-login entry: %s", e)
+        if found["pids"] and not first:
+            first = guard.take_over()
+    config["source_copy_settled"] = True
+    save_config(config)
+    return first
 
 
 class SingleInstance:
@@ -885,6 +1070,16 @@ class SingleInstance:
         self.sock = s
         threading.Thread(target=self._serve, daemon=True).start()
         return True
+
+    def take_over(self, wait=5.0):
+        """Become the copy that answers the doorbell, after the copy that was
+        first has been stopped. (This copy holds the mutex too, so any later
+        launch already sees it as the first.) False if something still has
+        the port - in which case another copy is running after all."""
+        deadline = time.time() + wait
+        while self.sock is None and not self._listen() and time.time() < deadline:
+            time.sleep(0.2)
+        return self.sock is not None
 
     def _serve(self):
         while True:
@@ -2137,8 +2332,10 @@ class TaskPanel:
 #
 # A connector watches one chat service and turns messages into notes. The
 # rule is the same everywhere: a message containing the trigger word becomes
-# a note when you wrote it, when it mentions you, or when it was sent to you
-# directly. Marking the note done can post a reply in the thread it came from.
+# a note for whoever it is meant for. One that mentions you, or was sent to
+# you directly, is yours. One you wrote is yours too - unless you addressed
+# it to someone else, in which case it is theirs alone. Marking the note
+# done can post a reply in the thread it came from.
 #
 # Each connector runs on its own thread and reaches the app only through the
 # message queue, so nothing in this section touches Tk:
@@ -2436,8 +2633,11 @@ class MattermostConnector(SocketConnector):
             "password: create one under Profile → Security → Personal Access "
             "Tokens (an admin may have to enable them) and revoke it any time "
             "without changing your login.\n\n"
-            "A message containing the trigger word becomes a note when you sent "
-            "it or it mentions you.")
+            "To remind a colleague: send them a direct message containing the "
+            "trigger word, or mention them next to it in a channel - "
+            "'@reminder @their.name send the report'. It lands on their list if "
+            "they run this app too. A message with the trigger word and nobody "
+            "else addressed is a reminder for yourself.")
 
     def __init__(self, config, queue):
         super().__init__(config, queue)
@@ -2450,6 +2650,7 @@ class MattermostConnector(SocketConnector):
         self.user_id = None
         self.my_username = ""
         self._refused = 0
+        self._is_user = {}                # @word -> is it a real user here?
 
     @classmethod
     def configured(cls, config):
@@ -2539,7 +2740,7 @@ class MattermostConnector(SocketConnector):
                         self.status(f"Connected as @{self.my_username}", True)
                     if ev.get("event") == "posted":
                         try:
-                            self._on_post(ev.get("data") or {})
+                            await self._on_post(ev.get("data") or {})
                         except Exception as e:
                             log.error("Mattermost event error: %s", e)
         finally:
@@ -2553,26 +2754,60 @@ class MattermostConnector(SocketConnector):
                     raise ConnectorError("The server keeps refusing the access "
                                          "token - create a new one")
 
-    def _on_post(self, d):
+    async def _on_post(self, d):
         post = json.loads(d.get("post") or "{}")
         message = post.get("message", "")
         from_me = post.get("user_id", "") == self.user_id
         me_tag = f"@{self.my_username}" if self.my_username else ""
         mentioned = self.mentions(message, me_tag)
+        direct = d.get("channel_type") == "D"               # one-to-one, not a group chat
         where = dict(sender=(d.get("sender_name") or "Unknown").lstrip("@"),
-                     channel=d.get("channel_display_name") or d.get("channel_name"),
+                     channel=("direct message" if direct else
+                              d.get("channel_display_name") or d.get("channel_name")),
                      channel_id=post.get("channel_id", ""), post_id=post.get("id", ""),
                      # a reply must name the thread's root, not the post inside it
                      thread_id=post.get("root_id") or post.get("id", ""))
         if self.wants(message):
-            if from_me or mentioned:
-                self.emit(raw=message, text=self.clean(message, me_tag),
-                          is_self=from_me, **where)
-        elif (not from_me and (mentioned or d.get("channel_type") == "D")
+            if from_me:
+                # Mine - unless I addressed it to someone else, in which case it
+                # is theirs and lands on their list, not on both.
+                ids = (d.get("channel_name") or "").split("__")
+                to_another = direct and len(ids) == 2 and any(i != self.user_id for i in ids)
+                if not mentioned and (to_another or
+                                      await self.call(self._names_someone_else, message)):
+                    return
+                self.emit(raw=message, text=self.clean(message, me_tag), is_self=True, **where)
+            elif mentioned or direct:
+                # Someone else's message that mentions me, or that they sent to
+                # me directly. (A direct message needs no @mention: who else
+                # could it be for?)
+                self.emit(raw=message, text=self.clean(message, me_tag), is_self=False, **where)
+        elif (not from_me and (mentioned or direct)
               and not post.get("type")                      # "joined the channel" etc.
               and not (post.get("props") or {}).get("from_webhook")):
             # No trigger word, but it is addressed to you.
             self.offer(text=self.clean(message, me_tag), **where)
+
+    def _names_someone_else(self, message):
+        """Does this message @mention a real user other than me? Asks the
+        server which of the @words are users, so that '@home' or an email
+        address is not mistaken for a person. If the server cannot be asked,
+        the answer is no: better a note too many than one silently dropped."""
+        words = {w.rstrip(".").lower()
+                 for w in re.findall(r"(?<![\w@.])@([A-Za-z][\w.-]*)", message or "")}
+        words -= {self.my_username.lower(), "channel", "all", "here",
+                  self.trigger.lstrip("@").lower()}
+        unknown = sorted(w for w in words if w not in self._is_user)
+        if unknown:
+            try:
+                real = {(u.get("username") or "").lower()
+                        for u in self._api("/users/usernames", unknown)}
+            except Exception as e:
+                log.warning("Mattermost user lookup failed: %s", e)
+                return False
+            for w in unknown:
+                self._is_user[w] = w in real
+        return any(self._is_user.get(w) for w in words)
 
     def thread(self, note):
         root = note.get("thread_id") or note.get("post_id")
@@ -2742,6 +2977,9 @@ class SlackConnector(SocketConnector):
         if tagged:
             if not (from_me or mentioned or direct):
                 return
+            if (from_me and not mentioned and not direct
+                    and set(re.findall(r"<@([A-Z0-9]+)", text)) - self.me_ids):
+                return                    # I addressed it to someone else: theirs, not mine
         elif from_me or not (mentioned or direct):
             return                        # untagged: only what others address to you
         for uid in re.findall(r"<@([A-Z0-9]+)", text)[:5]:
@@ -2988,6 +3226,8 @@ class DiscordConnector(SocketConnector):
         if tagged:
             if not (from_me or addressed):
                 return
+            if from_me and not addressed and pinged:
+                return                    # I addressed it to someone else: theirs, not mine
         elif from_me or not addressed:
             return                        # untagged: only what others address to you
         names = {m.get("id"): m.get("global_name") or m.get("username") or "someone"
@@ -3940,6 +4180,11 @@ class StickyNotesApp:
         # Under pythonw there is no console, so an error in a callback would
         # otherwise vanish without a trace.
         self.root.report_callback_exception = self._log_ui_error
+        try:
+            # the app's own icon on every window, instead of Tk's feather
+            self.root.iconbitmap(default=ICON_FILE)
+        except Exception:
+            pass                          # running from source without the assets folder
         self.root.title(f"{APP_NAME}")
         self.root.configure(bg=T.bg)
         self.root.geometry(usable_geometry(self.config.get("window_geometry")))
@@ -6647,8 +6892,10 @@ class StickyNotesApp:
         # and setup steps, so a new connector needs no code here.
         p3 = page("Connectors")
         section(p3, "Turn chat messages into notes")
-        hint(p3, "A message containing the trigger word becomes a note when you wrote "
-                 "it, when it mentions you, or when it was sent to you directly. "
+        hint(p3, "A message containing the trigger word becomes a note for whoever it "
+                 "is meant for. Written with nobody else addressed, it is a reminder "
+                 "for yourself. Mention someone, or send it to them directly, and it "
+                 "is theirs: it shows up on their copy of this app, not on yours. "
                  "Add !urgent, !high or !low to the message to set the priority.")
         v_trig, _ = entry(p3, "Trigger word", self.config.get("trigger_word", "@reminder"),
                           width=18)
@@ -6903,15 +7150,18 @@ class StickyNotesApp:
                        highlightthickness=0, anchor="w", cursor="hand2",
                        command=toggle_startup).pack(anchor="w")
         su_state.pack(anchor="w", pady=(2, 0))
-        hint(p4, f"Launches {os.path.basename(PYTHONW)} directly, so only ONE process runs. "
-                 f"(The old shortcut used the WindowsApps alias, which spawned a second "
-                 f"lingering pythonw.exe.)")
+        if FROZEN:
+            hint(p4, "Starts quietly in the tray when you sign in to Windows.")
+        else:
+            hint(p4, f"Launches {os.path.basename(PYTHONW)} directly, so only ONE process "
+                     f"runs. (The old shortcut used the WindowsApps alias, which spawned a "
+                     f"second lingering pythonw.exe.)")
 
         section(p4, "Window")
         v_min = check(p4, "Start minimised to the tray", "start_minimized")
         v_tray = check(p4, "Closing the window hides to the tray instead of quitting",
                        "close_to_tray")
-        if not self.tray.available:
+        if not self.tray.available and not FROZEN:
             hint(p4, "Tray icon unavailable - install it with:  "
                      "python -m pip install pystray pillow")
 
@@ -6923,7 +7173,7 @@ class StickyNotesApp:
         self._btn(mrow2, "Open log", self.open_log,
                   font=self.font_tiny, pad=(10, 4)).pack(side="left", padx=(0, 6))
         self._btn(mrow2, "Open data folder",
-                  lambda: os.startfile(SCRIPT_DIR),
+                  lambda: os.startfile(CONFIG_DIR),
                   font=self.font_tiny, pad=(10, 4)).pack(side="left", padx=(0, 6))
         self._btn(mrow2, "Open backups", self.open_backups,
                   font=self.font_tiny, pad=(10, 4)).pack(side="left")
@@ -7018,16 +7268,126 @@ class StickyNotesApp:
 #  Entry point
 # ═══════════════════════════════════════════════════════
 
+def self_test(folder):
+    """`--self-test <folder>`: prove that this copy of the app can run.
+
+    Meant for the packaged program, where a module left out of the bundle
+    would otherwise only show up on somebody else's PC - and a windowed
+    program has no console to complain on. Everything it writes goes into
+    `folder`: it touches no real notes or settings, shows no window, and
+    writes its findings to self_test.json there. Returns 0 if all is well.
+    """
+    global DATA_FILE, CONFIG_FILE, LOG_FILE, BACKUP_DIR, SUGGEST_FILE
+    os.makedirs(folder, exist_ok=True)
+    DATA_FILE = os.path.join(folder, "notes.json")
+    CONFIG_FILE = os.path.join(folder, "config.json")
+    LOG_FILE = os.path.join(folder, "self_test.log")
+    BACKUP_DIR = os.path.join(folder, "backups")
+    SUGGEST_FILE = os.path.join(folder, "suggestions.json")
+    log.handlers.clear()
+    report = {"version": APP_VERSION, "packaged": FROZEN, "python": sys.version.split()[0],
+              "program": sys.executable, "checks": {}}
+
+    def check(name, fn):
+        try:
+            detail = fn()
+            report["checks"][name] = "ok" if detail in (None, True) else f"ok ({detail})"
+        except Exception as e:
+            report["checks"][name] = f"FAILED: {type(e).__name__}: {e}"
+
+    def must(condition, message):
+        if not condition:
+            raise AssertionError(message)
+
+    def secrets():
+        must(unprotect(protect("s3cret ✓")) == "s3cret ✓", "DPAPI round trip")
+
+    def sockets():
+        import websockets
+        from websockets.exceptions import ConnectionClosed  # noqa: F401
+        websockets.connect                    # resolved lazily: proves the client is bundled
+        return websockets.__version__
+
+    def claude():
+        import anthropic
+        anthropic.Anthropic(api_key="not-a-real-key")
+        return anthropic.__version__
+
+    def tray_parts():
+        import pystray  # noqa: F401
+        from PIL import Image, ImageDraw  # noqa: F401
+        Tray._image(None, False)
+
+    def secure_transport():
+        must(tls_context().verify_mode == ssl.CERT_REQUIRED, "certificate checks are off")
+
+    def icon():
+        must(os.path.isfile(ICON_FILE), f"missing {ICON_FILE}")
+
+    def the_app():
+        # Build the real windows, but never let one reach the screen: no tray
+        # icon, nothing raised, and each window withdrawn before Tk maps it.
+        Tray.start = lambda self: None
+        globals()["force_foreground"] = lambda win, focus=None: None
+
+        def hide_windows():
+            for w in [app.root] + app.root.winfo_children():
+                if isinstance(w, (tk.Tk, tk.Toplevel)):
+                    w.withdraw()
+            app.root.update()
+
+        save_notes([_normalise({"id": 1, "text": "self-test", "tasks": [
+            {"title": "a task", "percent": 50},
+            {"title": "another", "mode": "stages", "stage": 1}]}, 1)])
+        app = StickyNotesApp()
+        hide_windows()
+        must(len(app.notes) == 1 and note_progress(app.notes[0])[1] == 2, "notes did not load")
+        app.open_note(1)                      # the editor, with its Tasks panel
+        hide_windows()
+        app.notes[0]["text"] = "self-test, edited"
+        save_notes(app.notes)
+        must(load_notes()[0]["text"] == "self-test, edited", "notes did not survive a save")
+        app.open_settings("AI")               # every settings page, built from the lists
+        hide_windows()
+        save_config(app.config)
+        must(load_config()["trigger_word"] == "@reminder", "settings did not survive a save")
+        app.root.destroy()
+        return f"{len(CONNECTORS)} connectors, {len(AI_PROVIDERS)} AI providers"
+
+    check("credentials encryption", secrets)
+    check("websocket client", sockets)
+    check("anthropic sdk", claude)
+    check("tray icon parts", tray_parts)
+    check("tls verification", secure_transport)
+    check("icon file", icon)
+    check("app starts, saves and loads", the_app)
+    report["passed"] = all(str(v).startswith("ok") for v in report["checks"].values())
+    with open(os.path.join(folder, "self_test.json"), "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    return 0 if report["passed"] else 1
+
+
 def main():
     try:
-        import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
+
+    if "--self-test" in sys.argv:
+        where = sys.argv[sys.argv.index("--self-test") + 1:][:1]
+        code = self_test(where[0] if where else os.path.join(HOME, "sticky_reminders_self_test"))
+        os._exit(code)                        # background threads must not keep it alive
 
     holder = {}
     guard = SingleInstance(lambda: holder["app"].post(holder["app"].show_window))
-    if not guard.acquire():
+    first = guard.acquire()
+    if FROZEN:
+        first = settle_source_copy(guard, first)
+    if not first:
         # Another copy is already running - wake it up instead of starting a second.
         SingleInstance.signal_existing()
         log.info("Another instance is running; asked it to show and exited.")

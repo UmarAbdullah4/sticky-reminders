@@ -51,9 +51,46 @@ a minute or two and **take the keyboard focus while they run**, so do not type
 during a run: stray keystrokes land in the test windows and can fail a check.
 If one check fails oddly, run that suite once more before investigating.
 
-CI runs the linter, a compile check, the version check and the connector suite
-on every push and pull request. Run the window suites yourself before sending a
+CI runs the linter, a compile check, the version check, the app's self-test and
+the connector suite on every push and pull request, then builds the installer
+and installs it for real. Run the window suites yourself before sending a
 change that touches the UI.
+
+## Building the installer
+
+```
+winget install JRSoftware.InnoSetup
+python tools/build_installer.py
+```
+
+This leaves `StickyReminders-Setup-<version>.exe` and
+`StickyReminders-<version>-portable.zip` in `dist/`. The script creates its own
+virtual environment in `build/venv` on first use, packs the app with
+PyInstaller, makes the packed program test itself (`--self-test`), and only then
+builds the Setup file with Inno Setup (`installer/sticky_reminders.iss`). Run it
+from an ordinary terminal, not an administrator one.
+
+```
+python tests/test_installer.py
+```
+
+installs that Setup file silently into a scratch folder, checks the entry in
+Windows' installed apps and the shortcuts, installs over the top, runs the
+installed program's self-test and uninstalls again. Neither download is
+code-signed, so on a PC with Smart App Control switched on Windows refuses to
+run the Setup file and the test says it could not run. CI has no such policy
+and runs it on every push.
+
+Things to keep in mind when changing how the app is packaged:
+
+- The app must work both ways. `FROZEN` is true in the packaged program, where
+  it must not write next to its own files: settings go to
+  `%APPDATA%\StickyReminders`.
+- A module that is only imported by name at run time has to be named in
+  `tools/build_installer.py`, or the self-test will fail on the packed program.
+- `AppId` in the `.iss` file identifies the app to Windows. Never change it, or
+  a new Setup will install a second copy instead of upgrading the first.
+- `assets/icon.ico` is drawn by `tools/make_icon.py`.
 
 ## Style
 
@@ -93,7 +130,9 @@ that break how the app or its files are used, **minor** for new features,
    ```
 
 Pushing the tag runs the Release workflow, which checks that the tag,
-`APP_VERSION` and the changelog agree, then publishes a GitHub Release with
-that version's changelog entry as its notes and the script attached.
+`APP_VERSION` and the changelog agree, builds and install-tests the Setup file,
+then publishes a GitHub Release with that version's changelog entry as its
+notes and the Setup file, the portable zip, their checksums and the script
+attached.
 
 `python tools/release_notes.py --check` runs the same check locally.
